@@ -29979,15 +29979,29 @@ function buildRouteOffsetCurves(pointCount, offsetMeters, laps) {
   }
   return curves;
 }
-function buildAllPoints(points, laps, offsetMeters, loop) {
+// laps：总圈数；firstPoints / lastPoints：可选的「首圈 / 尾圈」自定义形状。
+// 首圈替换第 1 圈，尾圈替换最后一圈，中间各圈仍用主路线。
+function buildLapPoints(points, loop) {
+  if (!Array.isArray(points) || points.length < 2) return null;
+  return loop ? buildClosedBasePoints(points) : points;
+}
+function buildAllPoints(points, laps, offsetMeters, loop, firstPoints, lastPoints) {
   const basePoints = loop ? buildClosedBasePoints(points) : points;
   const usedLaps = loop && laps > 0 ? laps : 1;
+  const firstLap = usedLaps > 1 ? buildLapPoints(firstPoints, loop) : null;
+  const lastLap = usedLaps > 1 ? buildLapPoints(lastPoints, loop) : null;
   const allPoints = [];
-  const curves = buildRouteOffsetCurves(basePoints.length, offsetMeters, usedLaps);
   for (let lapIndex = 0; lapIndex < usedLaps; lapIndex++) {
-    const curve = curves[lapIndex];
-    for (let i = 0; i < basePoints.length; i++) {
-      const p = basePoints[i];
+    let lapPoints = basePoints;
+    if (lapIndex === 0 && firstLap) {
+      lapPoints = firstLap;
+    } else if (lapIndex === usedLaps - 1 && lastLap) {
+      lapPoints = lastLap;
+    }
+    const curves = buildRouteOffsetCurves(lapPoints.length, offsetMeters, 1);
+    const curve = curves[0];
+    for (let i = 0; i < lapPoints.length; i++) {
+      const p = lapPoints[i];
       const c = curve && curve[i];
       if (c && (c.lat !== 0 || c.lon !== 0)) {
         allPoints.push(offsetPointMeters(p, c.lat, c.lon));
@@ -30098,6 +30112,13 @@ function buildActivity(body) {
     ? Math.max(0, Math.min(ROUTE_OFFSET_LIMIT_METERS, Number(offsetRaw)))
     : 0;
   const cleanPoints = validatePoints(body && body.points);
+  // 可选的首圈 / 尾圈自定义形状（起点终点不在同一位置时用）
+  const firstLapRaw = body && body.firstLapPoints;
+  const lastLapRaw = body && body.lastLapPoints;
+  const firstLapPoints =
+    Array.isArray(firstLapRaw) && firstLapRaw.length > 0 ? validatePoints(firstLapRaw) : null;
+  const lastLapPoints =
+    Array.isArray(lastLapRaw) && lastLapRaw.length > 0 ? validatePoints(lastLapRaw) : null;
   if (!startTime || Number.isNaN(new Date(startTime).getTime())) {
     throw { status: 400, message: "startTime \u683C\u5F0F\u4E0D\u6B63\u786E" };
   }
@@ -30108,7 +30129,14 @@ function buildActivity(body) {
   const lapsRaw = Number(lapCount);
   const laps = loop && Number.isFinite(lapsRaw) && lapsRaw > 0 ? Math.min(200, Math.floor(lapsRaw)) : 1;
   const weight = Number.isFinite(Number(weightKg)) && weightKg > 30 && weightKg < 150 ? Number(weightKg) : 65;
-  const allPoints = buildAllPoints(cleanPoints, laps, jitter ? routeOffsetMeters : 0, loop);
+  const allPoints = buildAllPoints(
+    cleanPoints,
+    laps,
+    jitter ? routeOffsetMeters : 0,
+    loop,
+    firstLapPoints,
+    lastLapPoints
+  );
   const distances = [0];
   let totalDist = 0;
   for (let i = 1; i < allPoints.length; i++) {

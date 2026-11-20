@@ -329,3 +329,45 @@ button.secondary:disabled:hover {
 .route-vertex span:hover {
   background: #ffe0d6;
 }
+
+/* ===== 分段路线（首圈 / 尾圈） ===== */
+.seg-tabs {
+  display: flex;
+  gap: 6px;
+}
+
+.seg-tab {
+  flex: 1 1 0;
+  padding: 5px 4px;
+  font-size: 13px;
+  border-radius: 8px;
+  border: 1px solid #d1d5db;
+  background: #f9fafb;
+  color: #374151;
+}
+
+.seg-tab:hover {
+  background: #eef2ff;
+}
+
+.seg-tab.active {
+  background: #ff5722;
+  border-color: #ff5722;
+  color: #ffffff;
+}
+
+.seg-tab.active:hover {
+  background: #ff5722;
+}
+
+.seg-tab[data-segment="first"].active,
+.seg-tab[data-segment="first"].active:hover {
+  background: #16a34a;
+  border-color: #16a34a;
+}
+
+.seg-tab[data-segment="last"].active,
+.seg-tab[data-segment="last"].active:hover {
+  background: #2563eb;
+  border-color: #2563eb;
+}

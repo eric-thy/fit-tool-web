@@ -174,9 +174,17 @@ let currentSourceId = "tianditu";
 let coordConvertEnabled = false;
 
 // 轨迹与预览状态
-let routePoints = [];
+// 路线分成三段：main（主路线，所有中间圈都用它）、first（首圈）、last（尾圈）
+// 首圈 / 尾圈是可选的，用来模拟起点终点不在同一个位置的真实跑步轨迹。
+const SEGMENT_KEYS = ["main", "first", "last"];
+const SEGMENT_LABELS = { main: "主路线", first: "首圈", last: "尾圈" };
+const SEGMENT_COLORS = { main: "#ff5722", first: "#16a34a", last: "#2563eb" };
+const segments = { main: [], first: [], last: [] };
+const segmentEnabled = { first: false, last: false };
+const polylines = { main: null, first: null, last: null };
+let activeSegment = "main";
+
 let routeMode = "loop"; // "loop" 环形（自动闭合）/ "linear" 线性（不闭合）
-let polyline = null;
 let previewData = null;
 let previewTimer = null;
 let previewIndex = 0;
@@ -243,16 +251,25 @@ function clearPreviewOverlay() {
 
 function clearRoute(options) {
   const opts = options || {};
-  if (opts.recordHistory !== false && routePoints.length > 0) {
+  const hasAny = SEGMENT_KEYS.some((key) => segments[key].length > 0);
+  if (opts.recordHistory !== false && hasAny) {
     pushHistory();
   }
-  routePoints = [];
+  SEGMENT_KEYS.forEach((key) => {
+    segments[key] = [];
+  });
+  segmentEnabled.first = false;
+  segmentEnabled.last = false;
+  activeSegment = "main";
   removeAllVertices();
-  if (polyline) {
-    map.removeLayer(polyline);
-    polyline = null;
-  }
+  SEGMENT_KEYS.forEach((key) => {
+    if (polylines[key]) {
+      map.removeLayer(polylines[key]);
+      polylines[key] = null;
+    }
+  });
   clearPreviewOverlay();
+  syncSegmentUi();
   updateDistanceInfo();
   updateHistoryButtons();
 }
@@ -324,9 +341,10 @@ function toMapCoords(lat, lng) {
   return coordConvertEnabled ? wgs84ToGcj02(lat, lng) : { lat, lng };
 }
 
-function convertRoutePointsToWgs84() {
-  if (!coordConvertEnabled) return routePoints;
-  return routePoints.map((p) => gcj02ToWgs84(p.lat, p.lng));
+// 把某一段的坐标转换到 WGS-84（生成 FIT / 预览用）
+function convertPointsToWgs84(points) {
+  if (!coordConvertEnabled) return points.map((p) => ({ lat: p.lat, lng: p.lng }));
+  return points.map((p) => gcj02ToWgs84(p.lat, p.lng));
 }
 
 // 初始化地图源下拉框
@@ -577,8 +595,9 @@ function closedRoutePoints(points) {
 }
 
 // 环形模式：首尾自动相连（闭合）；线性模式：保持原始路线
-function displayRoutePoints() {
-  return routeMode === "loop" ? closedRoutePoints(routePoints) : routePoints;
+function segmentDisplayPoints(segmentKey) {
+  const points = segments[segmentKey];
+  return routeMode === "loop" ? closedRoutePoints(points) : points;
 }
 
 // 线性模式固定 1 圈；环形模式读取圈数输入
@@ -588,31 +607,61 @@ function getLapCount() {
   return Math.max(1, parseInt(lapInput && lapInput.value, 10) || 1);
 }
 
-function refreshPolyline() {
-  if (polyline) polyline.setLatLngs(displayRoutePoints());
+// 某个分段是否可用：主路线有 2 个点即可；首圈/尾圈还需要勾选启用
+function segmentUsable(segmentKey) {
+  if (segments[segmentKey].length < 2) return false;
+  if (segmentKey === "main") return true;
+  return Boolean(segmentEnabled[segmentKey]);
+}
+
+function segmentDistanceMeters(segmentKey) {
+  const points = segments[segmentKey];
+  if (points.length < 2) return 0;
+  if (routeMode === "loop") return computeDistanceMeters(closedRoutePoints(points));
+  return computeDistanceMeters(points);
+}
+
+// 多圈总距离：首圈 / 尾圈各替换掉一圈，其余圈用主路线
+function computeTotalDistanceMeters() {
+  const laps = getLapCount();
+  const mainMeters = segmentDistanceMeters("main");
+  if (routeMode !== "loop" || laps <= 1) return mainMeters;
+  const useFirst = segmentUsable("first");
+  const useLast = segmentUsable("last");
+  const customLaps = (useFirst ? 1 : 0) + (useLast ? 1 : 0);
+  const middleLaps = Math.max(0, laps - customLaps);
+  let total = mainMeters * middleLaps;
+  if (useFirst) total += segmentDistanceMeters("first");
+  if (useLast) total += segmentDistanceMeters("last");
+  return total;
 }
 
 function updateDistanceInfo() {
   const el = document.getElementById("distanceInfo");
   if (!el) return;
-  if (!routePoints || routePoints.length < 2) {
+  const laps = getLapCount();
+  const mainMeters = segmentDistanceMeters("main");
+  if (!segments.main.length || mainMeters <= 0) {
     el.textContent = "总距离约：0 公里";
     return;
   }
-  const baseMeters = computeDistanceMeters(displayRoutePoints());
-  const baseKm = baseMeters / 1000;
-  const laps = getLapCount();
-  const totalKm = baseKm * laps;
-  const baseStr = baseKm.toFixed(2);
-  const totalStr = totalKm.toFixed(2);
+  const totalKm = (computeTotalDistanceMeters() / 1000).toFixed(2);
   if (routeMode === "loop" && laps > 1) {
-    el.textContent = `总距离约：${totalStr} 公里（基础：${baseStr} 公里 × ${laps} 圈）`;
+    const useFirst = segmentUsable("first");
+    const useLast = segmentUsable("last");
+    const customLaps = (useFirst ? 1 : 0) + (useLast ? 1 : 0);
+    const middle = Math.max(0, laps - customLaps);
+    const parts = [];
+    if (middle > 0) parts.push(`主路线 ${(mainMeters / 1000).toFixed(2)} × ${middle} 圈`);
+    if (useFirst) parts.push(`首圈 ${(segmentDistanceMeters("first") / 1000).toFixed(2)}`);
+    if (useLast) parts.push(`尾圈 ${(segmentDistanceMeters("last") / 1000).toFixed(2)}`);
+    el.textContent = `总距离约：${totalKm} 公里（${parts.join(" + ")}）`;
   } else {
-    el.textContent = `总距离约：${baseStr} 公里`;
+    el.textContent = `总距离约：${totalKm} 公里`;
   }
 }
 
-// ==================== 路线编辑：撤回 / 结点拖动 / 整体平移 / 导入导出 ====================
+// ==================== 路线编辑：分段 / 撤回 / 结点拖动 / 整体平移 / 导入导出 ====================
 function clonePoints(points) {
   return (points || []).map((p) => ({ lat: p.lat, lng: p.lng }));
 }
@@ -638,18 +687,52 @@ function samePoints(a, b) {
   return true;
 }
 
-function pushHistory() {
-  undoStack.push(clonePoints(routePoints));
-  if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
-  redoStack.length = 0;
-  updateHistoryButtons();
+// ---------- 撤回栈（快照：三段路线 + 启用状态；不记录当前编辑段，避免撤回时跳标签） ----------
+function snapshotState() {
+  return {
+    enabled: { first: Boolean(segmentEnabled.first), last: Boolean(segmentEnabled.last) },
+    points: {
+      main: clonePoints(segments.main),
+      first: clonePoints(segments.first),
+      last: clonePoints(segments.last)
+    }
+  };
+}
+
+function statesEqual(a, b) {
+  if (!a || !b) return false;
+  return (
+    a.enabled.first === b.enabled.first &&
+    a.enabled.last === b.enabled.last &&
+    samePoints(a.points.main, b.points.main) &&
+    samePoints(a.points.first, b.points.first) &&
+    samePoints(a.points.last, b.points.last)
+  );
+}
+
+function applySnapshot(snap) {
+  segments.main = clonePoints(snap.points.main);
+  segments.first = clonePoints(snap.points.first);
+  segments.last = clonePoints(snap.points.last);
+  segmentEnabled.first = Boolean(snap.enabled.first);
+  segmentEnabled.last = Boolean(snap.enabled.last);
 }
 
 function updateHistoryButtons() {
-  const undoBtn = document.getElementById("undoBtn");
-  const redoBtn = document.getElementById("redoBtn");
-  if (undoBtn) undoBtn.disabled = undoStack.length === 0;
-  if (redoBtn) redoBtn.disabled = redoStack.length === 0;
+  const undoButton = document.getElementById("undoBtn");
+  const redoButton = document.getElementById("redoBtn");
+  if (undoButton) undoButton.disabled = undoStack.length === 0;
+  if (redoButton) redoButton.disabled = redoStack.length === 0;
+}
+
+function pushHistory() {
+  const snap = snapshotState();
+  const last = undoStack[undoStack.length - 1];
+  if (last && statesEqual(last, snap)) return;
+  undoStack.push(snap);
+  if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+  redoStack.length = 0;
+  updateHistoryButtons();
 }
 
 function undo() {
@@ -658,9 +741,10 @@ function undo() {
     updateMessage("没有可撤回的操作");
     return false;
   }
-  redoStack.push(clonePoints(routePoints));
-  routePoints = clonePoints(undoStack.pop());
+  redoStack.push(snapshotState());
+  applySnapshot(undoStack.pop());
   clearPreviewOverlay();
+  syncSegmentUi();
   renderRoute();
   updateMessage("已撤回（Ctrl+Y 重做）");
   return true;
@@ -672,42 +756,115 @@ function redo() {
     updateMessage("没有可重做的操作");
     return false;
   }
-  undoStack.push(clonePoints(routePoints));
+  undoStack.push(snapshotState());
   if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
-  routePoints = clonePoints(redoStack.pop());
+  applySnapshot(redoStack.pop());
   clearPreviewOverlay();
+  syncSegmentUi();
   renderRoute();
   updateMessage("已重做");
   return true;
 }
 
-function routePolylineOptions() {
+// ---------- 分段界面 ----------
+function syncSegmentUi() {
+  const tabs = document.querySelectorAll("[data-segment]");
+  Array.prototype.forEach.call(tabs, (button) => {
+    const key = button.getAttribute("data-segment");
+    if (key === activeSegment) button.classList.add("active");
+    else button.classList.remove("active");
+  });
+
+  const firstBox = document.getElementById("useFirstLap");
+  const lastBox = document.getElementById("useLastLap");
+  if (firstBox) firstBox.checked = Boolean(segmentEnabled.first);
+  if (lastBox) lastBox.checked = Boolean(segmentEnabled.last);
+
+  const clearButton = document.getElementById("clearRoute");
+  if (clearButton) clearButton.textContent = "清除" + SEGMENT_LABELS[activeSegment];
+
+  const hint = document.getElementById("segmentHint");
+  if (hint) {
+    let text;
+    if (activeSegment === "main") {
+      text = "中间圈都用主路线；首圈 / 尾圈可单独绘制。";
+    } else if (getLapCount() < 2) {
+      text = `圈数至少为 2 时，自定义${SEGMENT_LABELS[activeSegment]}才会生效。`;
+    } else {
+      text = `正在编辑${SEGMENT_LABELS[activeSegment]}，会替换${activeSegment === "first" ? "第一圈" : "最后一圈"}。`;
+    }
+    hint.textContent = text;
+  }
+}
+
+function switchSegment(key) {
+  if (!SEGMENT_LABELS[key] || key === activeSegment) {
+    syncSegmentUi();
+    return;
+  }
+  activeSegment = key;
+  if (key !== "main" && !segmentEnabled[key] && segments[key].length > 0) {
+    segmentEnabled[key] = true;
+  } else if (key !== "main") {
+    segmentEnabled[key] = true;
+  }
+  clearPreviewOverlay();
+  renderRoute();
+  updateMessage(`正在编辑${SEGMENT_LABELS[key]}（${segments[key].length} 个结点）`);
+}
+
+function toggleSegmentEnabled(key, enabled) {
+  if (key !== "first" && key !== "last") return;
+  if (Boolean(segmentEnabled[key]) === Boolean(enabled)) return;
+  pushHistory();
+  segmentEnabled[key] = Boolean(enabled);
+  clearPreviewOverlay();
+  renderRoute();
+  updateMessage(
+    enabled
+      ? `已启用自定义${SEGMENT_LABELS[key]}（${segments[key].length} 个结点）`
+      : `已关闭自定义${SEGMENT_LABELS[key]}，该圈改用主路线`
+  );
+}
+
+// ---------- 绘制 ----------
+function polylineOptions(segmentKey) {
+  const isActive = segmentKey === activeSegment;
   return {
-    color: "#ff5722",
-    weight: 4,
-    opacity: 0.9,
-    interactive: true,
-    // 关掉事件冒泡：点线不再新增结点，拖动线用来整体平移
+    color: SEGMENT_COLORS[segmentKey],
+    weight: isActive ? 4 : 2.5,
+    opacity: isActive ? 0.95 : 0.6,
+    dashArray: isActive ? null : "6 6",
+    interactive: isActive,
     bubblingMouseEvents: false,
-    className: "route-line"
+    className: "route-line route-line-" + segmentKey
   };
 }
 
-function ensurePolyline() {
-  const latlngs = displayRoutePoints();
-  if (!latlngs || latlngs.length < 2) {
-    if (polyline) {
-      map.removeLayer(polyline);
-      polyline = null;
-    }
+function removePolyline(segmentKey) {
+  if (polylines[segmentKey]) {
+    map.removeLayer(polylines[segmentKey]);
+    polylines[segmentKey] = null;
+  }
+}
+
+function ensureSegmentPolyline(segmentKey) {
+  const points = segments[segmentKey];
+  if (points.length < 2) {
+    removePolyline(segmentKey);
     return;
   }
-  if (polyline) {
-    polyline.setLatLngs(latlngs);
-  } else {
-    polyline = L.polyline(latlngs, routePolylineOptions()).addTo(map);
-    polyline.on("mousedown", onRouteLineMouseDown);
+  const isActive = segmentKey === activeSegment;
+  const existing = polylines[segmentKey];
+  if (existing && existing._fitActive === isActive) {
+    existing.setLatLngs(segmentDisplayPoints(segmentKey));
+    return;
   }
+  if (existing) removePolyline(segmentKey);
+  const layer = L.polyline(segmentDisplayPoints(segmentKey), polylineOptions(segmentKey)).addTo(map);
+  layer._fitActive = isActive;
+  if (isActive) layer.on("mousedown", onRouteLineMouseDown);
+  polylines[segmentKey] = layer;
 }
 
 function vertexIcon() {
@@ -720,30 +877,31 @@ function vertexIcon() {
 }
 
 function createVertexMarker(index) {
-  const point = routePoints[index];
+  const points = segments[activeSegment];
+  const point = points[index];
   const marker = L.marker([point.lat, point.lng], {
     draggable: true,
     keyboard: false,
     autoPan: true,
     zIndexOffset: 1000,
     icon: vertexIcon(),
-    title: `结点 ${index + 1}（拖动可移动）`
+    title: `${SEGMENT_LABELS[activeSegment]} 结点 ${index + 1}（拖动可移动）`
   });
 
   marker.on("dragstart", () => {
     clearPreviewOverlay();
     isDraggingVertex = true;
-    dragSnapshot = { index, before: clonePoints(routePoints) };
-    undoStack.push(clonePoints(routePoints));
-    if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
-    redoStack.length = 0;
-    updateHistoryButtons();
+    dragSnapshot = { index, before: clonePoints(segments[activeSegment]) };
+    pushHistory();
   });
 
   marker.on("drag", (e) => {
     const latlng = e.target.getLatLng();
-    routePoints[index] = clampPoint({ lat: latlng.lat, lng: latlng.lng });
-    ensurePolyline();
+    const list = segments[activeSegment];
+    if (!list[index]) return;
+    list[index] = clampPoint({ lat: latlng.lat, lng: latlng.lng });
+    const layer = polylines[activeSegment];
+    if (layer) layer.setLatLngs(segmentDisplayPoints(activeSegment));
     updateDistanceInfo();
   });
 
@@ -751,51 +909,66 @@ function createVertexMarker(index) {
     isDraggingVertex = false;
     const snapshot = dragSnapshot;
     dragSnapshot = null;
-    if (snapshot && samePoints(snapshot.before, routePoints)) {
-      // 拖动后又回到原位：不留历史记录
+    if (snapshot && samePoints(snapshot.before, segments[activeSegment])) {
       undoStack.pop();
       updateHistoryButtons();
     } else {
-      updateMessage(`已移动结点 ${index + 1}（Ctrl+Z 撤回）`);
+      updateMessage(`已移动${SEGMENT_LABELS[activeSegment]}结点 ${index + 1}（Ctrl+Z 撤回）`);
     }
-    ensurePolyline();
+    const layer = polylines[activeSegment];
+    if (layer) layer.setLatLngs(segmentDisplayPoints(activeSegment));
     updateDistanceInfo();
   });
 
   return marker;
 }
 
-function renderVertices() {
-  while (vertexMarkers.length > routePoints.length) {
-    const extra = vertexMarkers.pop();
-    if (extra) map.removeLayer(extra);
-  }
-  for (let i = 0; i < routePoints.length; i++) {
-    if (!vertexMarkers[i]) {
-      vertexMarkers[i] = createVertexMarker(i).addTo(map);
-    } else {
-      vertexMarkers[i].setLatLng([routePoints[i].lat, routePoints[i].lng]);
-    }
-  }
-}
-
 function removeAllVertices() {
-  vertexMarkers.forEach((marker) => {
-    if (marker) map.removeLayer(marker);
-  });
+  for (let i = 0; i < vertexMarkers.length; i++) {
+    if (vertexMarkers[i]) map.removeLayer(vertexMarkers[i]);
+  }
   vertexMarkers = [];
 }
 
+function renderVertices() {
+  removeAllVertices();
+  const points = segments[activeSegment];
+  for (let i = 0; i < points.length; i++) {
+    vertexMarkers.push(createVertexMarker(i).addTo(map));
+  }
+}
+
+function moveVertexMarkers() {
+  const points = segments[activeSegment];
+  if (vertexMarkers.length !== points.length) {
+    renderVertices();
+    return;
+  }
+  for (let i = 0; i < points.length; i++) {
+    vertexMarkers[i].setLatLng([points[i].lat, points[i].lng]);
+  }
+}
+
 function renderRoute() {
-  ensurePolyline();
+  SEGMENT_KEYS.forEach((key) => ensureSegmentPolyline(key));
   renderVertices();
   updateDistanceInfo();
   updateHistoryButtons();
+  syncSegmentUi();
 }
 
-// 拖动整条路线：按住线拖动即可平移
+function refreshActiveSegmentGeometry() {
+  const layer = polylines[activeSegment];
+  if (layer) layer.setLatLngs(segmentDisplayPoints(activeSegment));
+  moveVertexMarkers();
+  updateDistanceInfo();
+}
+
+// ---------- 整条平移（只平移当前编辑的分段） ----------
 function onRouteLineMouseDown(e) {
-  if (isDraggingRoute || routePoints.length < 2) return;
+  if (isDraggingRoute) return;
+  const points = segments[activeSegment];
+  if (points.length < 2) return;
   if (e.originalEvent && typeof e.originalEvent.button === "number" && e.originalEvent.button !== 0) {
     return;
   }
@@ -803,12 +976,9 @@ function onRouteLineMouseDown(e) {
   if (!startLatLng) return;
 
   clearPreviewOverlay();
-  const origin = clonePoints(routePoints);
+  const origin = clonePoints(points);
   isDraggingRoute = true;
-  undoStack.push(clonePoints(routePoints));
-  if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
-  redoStack.length = 0;
-  updateHistoryButtons();
+  pushHistory();
 
   const mapWasDraggable = map.dragging ? map.dragging.enabled() : false;
   if (mapWasDraggable) map.dragging.disable();
@@ -823,10 +993,8 @@ function onRouteLineMouseDown(e) {
     const dLat = latlng.lat - startLatLng.lat;
     const dLng = latlng.lng - startLatLng.lng;
     if (!moved && (Math.abs(dLat) > 0 || Math.abs(dLng) > 0)) moved = true;
-    routePoints = origin.map((p) => clampPoint({ lat: p.lat + dLat, lng: p.lng + dLng }));
-    ensurePolyline();
-    renderVertices();
-    updateDistanceInfo();
+    segments[activeSegment] = origin.map((p) => clampPoint({ lat: p.lat + dLat, lng: p.lng + dLng }));
+    refreshActiveSegmentGeometry();
   };
 
   const finish = () => {
@@ -844,17 +1012,14 @@ function onRouteLineMouseDown(e) {
       undoStack.pop();
       updateHistoryButtons();
     } else {
-      // 拖线时地图拖动被禁用，Leaflet 不会自动抑制随后的 click，这里手动吞掉
       suppressMapClickUntil = Date.now() + 500;
-      updateMessage("已平移整条路线（Ctrl+Z 撤回）");
+      updateMessage(`已平移${SEGMENT_LABELS[activeSegment]}（Ctrl+Z 撤回）`);
     }
-    ensurePolyline();
-    updateDistanceInfo();
+    refreshActiveSegmentGeometry();
   };
 
   document.addEventListener("mousemove", onDocMove);
   document.addEventListener("mouseup", finish);
-  // 鼠标移出窗口/浏览器失焦时也要结束拖动，避免地图卡在禁用状态
   document.addEventListener("mouseleave", finish);
   if (typeof window !== "undefined" && window.addEventListener) {
     window.addEventListener("blur", finish);
@@ -879,32 +1044,44 @@ function round6(value) {
 }
 
 function buildRouteExportData() {
+  const features = [];
+  SEGMENT_KEYS.forEach((key) => {
+    const points = segments[key];
+    if (points.length < 2) return;
+    features.push({
+      type: "Feature",
+      properties: {
+        segment: key,
+        label: SEGMENT_LABELS[key],
+        enabled: key === "main" ? true : Boolean(segmentEnabled[key])
+      },
+      geometry: {
+        type: "LineString",
+        coordinates: points.map((p) => [round6(p.lng), round6(p.lat)])
+      }
+    });
+  });
   return {
-    type: "Feature",
+    type: "FeatureCollection",
     properties: {
       name: "Fit Tool route",
-      tool: "Fit Tool v1.6",
+      tool: "Fit Tool v1.7",
       routeMode,
       lapCount: getLapCount(),
       routeOffset: getRouteOffset(),
-      pointCount: routePoints.length,
       exportedAt: new Date().toISOString()
     },
-    geometry: {
-      type: "LineString",
-      coordinates: routePoints.map((p) => [round6(p.lng), round6(p.lat)])
-    }
+    features
   };
 }
 
 function exportRoute() {
-  if (routePoints.length < 2) {
-    updateMessage("至少需要两个点才能导出路线", true);
+  if (segments.main.length < 2) {
+    updateMessage("至少需要两个主路线结点才能导出路线", true);
     return;
   }
   try {
-    const data = buildRouteExportData();
-    const blob = new Blob([JSON.stringify(data, null, 2)], {
+    const blob = new Blob([JSON.stringify(buildRouteExportData(), null, 2)], {
       type: "application/geo+json"
     });
     const now = new Date();
@@ -918,7 +1095,10 @@ function exportRoute() {
       pad(now.getMinutes()) +
       pad(now.getSeconds());
     downloadBlob(blob, `route-${stamp}.geojson`);
-    updateMessage(`已导出路线：${routePoints.length} 个结点`);
+    const parts = SEGMENT_KEYS.filter((key) => segments[key].length >= 2).map(
+      (key) => `${SEGMENT_LABELS[key]} ${segments[key].length} 点`
+    );
+    updateMessage(`已导出路线：${parts.join(" / ")}`);
   } catch (e) {
     updateMessage("导出失败：" + ((e && e.message) || "未知错误"), true);
   }
@@ -996,14 +1176,55 @@ function validateImportedPoints(points) {
   return cleaned;
 }
 
+// 解析成 { main, first, last, enabled, props }
+function extractRouteSegments(data) {
+  const result = {
+    main: [],
+    first: [],
+    last: [],
+    enabled: { first: false, last: false },
+    props: {}
+  };
+  if (!data || typeof data !== "object") return result;
+
+  if (data.type === "FeatureCollection" && Array.isArray(data.features)) {
+    result.props = data.properties || {};
+    for (const feature of data.features) {
+      if (!feature || feature.type !== "Feature") continue;
+      const points = extractRoutePoints(feature);
+      if (!points || points.length < 1) continue;
+      const props = feature.properties || {};
+      const key = props.segment;
+      if (key === "first" || key === "last") {
+        result[key] = points;
+        result.enabled[key] = props.enabled === undefined ? true : Boolean(props.enabled);
+      } else if (key === "main") {
+        result.main = points;
+      } else if (!result.main.length) {
+        result.main = points;
+      }
+    }
+    return result;
+  }
+
+  const points = extractRoutePoints(data);
+  result.main = points || [];
+  result.props = data.properties || {};
+  return result;
+}
+
 function fitViewToRoute() {
-  if (!routePoints.length) return;
+  const all = [];
+  SEGMENT_KEYS.forEach((key) => {
+    segments[key].forEach((p) => all.push(p));
+  });
+  if (!all.length) return;
   try {
-    if (routePoints.length === 1) {
-      map.setView([routePoints[0].lat, routePoints[0].lng], Math.max(map.getZoom(), 15));
+    if (all.length === 1) {
+      map.setView([all[0].lat, all[0].lng], Math.max(map.getZoom(), 15));
       return;
     }
-    const bounds = L.latLngBounds(routePoints.map((p) => [p.lat, p.lng]));
+    const bounds = L.latLngBounds(all.map((p) => [p.lat, p.lng]));
     map.fitBounds(bounds, { padding: [40, 40], maxZoom: 18 });
   } catch (e) {
     // 视图调整失败不影响数据
@@ -1017,26 +1238,49 @@ function importRouteFromText(text) {
   } catch (e) {
     throw new Error("不是有效的 JSON / GeoJSON 文件");
   }
-  const raw = extractRoutePoints(data);
-  const points = validateImportedPoints(raw);
-  const props = (data && data.properties) || (data && data.features && data.features[0] && data.features[0].properties) || {};
+
+  const parsed = extractRouteSegments(data);
+  // 没标分段、只导入了单独一条线时，把它当成主路线
+  if (!parsed.main.length && parsed.first.length && !parsed.last.length) {
+    parsed.main = parsed.first;
+    parsed.first = [];
+    parsed.enabled.first = false;
+  } else if (!parsed.main.length && parsed.last.length) {
+    parsed.main = parsed.last;
+    parsed.last = [];
+    parsed.enabled.last = false;
+  }
+
+  if (parsed.main.length < 2) {
+    throw new Error("文件里没有主路线（至少需要 2 个点）");
+  }
+
+  const cleanMain = validateImportedPoints(parsed.main);
+  const cleanFirst = parsed.first.length ? validateImportedPoints(parsed.first) : [];
+  const cleanLast = parsed.last.length ? validateImportedPoints(parsed.last) : [];
 
   pushHistory();
   clearPreviewOverlay();
-  routePoints = points.map(clampPoint);
+  segments.main = cleanMain.map(clampPoint);
+  segments.first = cleanFirst.map(clampPoint);
+  segments.last = cleanLast.map(clampPoint);
+  segmentEnabled.first = segments.first.length >= 2 && parsed.enabled.first;
+  segmentEnabled.last = segments.last.length >= 2 && parsed.enabled.last;
+  activeSegment = "main";
 
-  if (props && (props.routeMode === "loop" || props.routeMode === "linear")) {
+  const props = parsed.props || {};
+  if (props.routeMode === "loop" || props.routeMode === "linear") {
     const modeSelect = document.getElementById("routeMode");
     if (modeSelect) {
       modeSelect.value = props.routeMode;
       applyRouteMode();
     }
   }
-  if (props && Number.isFinite(Number(props.lapCount)) && Number(props.lapCount) > 0) {
+  if (Number.isFinite(Number(props.lapCount)) && Number(props.lapCount) > 0) {
     const lapInput = document.getElementById("lapCount");
     if (lapInput) lapInput.value = String(Math.max(1, Math.floor(Number(props.lapCount))));
   }
-  if (props && Number.isFinite(Number(props.routeOffset))) {
+  if (Number.isFinite(Number(props.routeOffset))) {
     const offsetInput = document.getElementById("routeOffset");
     if (offsetInput) {
       offsetInput.value = String(clampRouteOffset(props.routeOffset));
@@ -1046,7 +1290,10 @@ function importRouteFromText(text) {
 
   renderRoute();
   fitViewToRoute();
-  updateMessage(`已导入路线：${routePoints.length} 个结点`);
+  const parts = [`主路线 ${segments.main.length} 点`];
+  if (segments.first.length >= 2) parts.push(`首圈 ${segments.first.length} 点`);
+  if (segments.last.length >= 2) parts.push(`尾圈 ${segments.last.length} 点`);
+  updateMessage(`已导入路线：${parts.join(" / ")}`);
 }
 
 function readFileAsText(file) {
@@ -1065,6 +1312,20 @@ function readFileAsText(file) {
   });
 }
 
+function clearActiveSegment() {
+  const key = activeSegment;
+  if (!segments[key].length) {
+    updateMessage(`${SEGMENT_LABELS[key]}已经是空的`);
+    return;
+  }
+  pushHistory();
+  segments[key] = [];
+  if (key !== "main") segmentEnabled[key] = false;
+  clearPreviewOverlay();
+  renderRoute();
+  updateMessage(`已清除${SEGMENT_LABELS[key]}（Ctrl+Z 可恢复）`);
+}
+
 map.on("click", (e) => {
   if (Date.now() < suppressMapClickUntil) {
     suppressMapClickUntil = 0;
@@ -1072,33 +1333,25 @@ map.on("click", (e) => {
   }
   pushHistory();
   clearPreviewOverlay();
-  routePoints.push(clampPoint({ lat: e.latlng.lat, lng: e.latlng.lng }));
+  segments[activeSegment].push(clampPoint({ lat: e.latlng.lat, lng: e.latlng.lng }));
+  if (activeSegment !== "main") segmentEnabled[activeSegment] = true;
   renderRoute();
-  updateMessage(`已添加点数：${routePoints.length}（Ctrl+Z 撤回）`);
+  updateMessage(
+    `已添加${SEGMENT_LABELS[activeSegment]}结点：${segments[activeSegment].length}（Ctrl+Z 撤回）`
+  );
 });
 
 const clearBtn = document.getElementById("clearRoute");
-clearBtn.addEventListener("click", () => {
-  if (!routePoints.length) {
-    updateMessage("轨迹已经是空的");
-    return;
-  }
-  clearRoute({ recordHistory: true });
-  updateMessage("轨迹已清除（Ctrl+Z 可恢复）");
-});
+if (clearBtn) {
+  clearBtn.addEventListener("click", () => clearActiveSegment());
+}
 
 const undoBtn = document.getElementById("undoBtn");
-if (undoBtn) {
-  undoBtn.addEventListener("click", () => undo());
-}
+if (undoBtn) undoBtn.addEventListener("click", () => undo());
 const redoBtn = document.getElementById("redoBtn");
-if (redoBtn) {
-  redoBtn.addEventListener("click", () => redo());
-}
+if (redoBtn) redoBtn.addEventListener("click", () => redo());
 const exportRouteBtn = document.getElementById("exportRouteBtn");
-if (exportRouteBtn) {
-  exportRouteBtn.addEventListener("click", () => exportRoute());
-}
+if (exportRouteBtn) exportRouteBtn.addEventListener("click", () => exportRoute());
 
 const importFileInput = document.getElementById("importFile");
 const importRouteBtn = document.getElementById("importRouteBtn");
@@ -1115,6 +1368,20 @@ if (importRouteBtn && importFileInput) {
       updateMessage((e && e.message) || "导入失败", true);
     }
   });
+}
+
+const segmentTabs = document.querySelectorAll("[data-segment]");
+Array.prototype.forEach.call(segmentTabs, (button) => {
+  button.addEventListener("click", () => switchSegment(button.getAttribute("data-segment")));
+});
+
+const useFirstCheckbox = document.getElementById("useFirstLap");
+if (useFirstCheckbox) {
+  useFirstCheckbox.addEventListener("change", () => toggleSegmentEnabled("first", useFirstCheckbox.checked));
+}
+const useLastCheckbox = document.getElementById("useLastLap");
+if (useLastCheckbox) {
+  useLastCheckbox.addEventListener("change", () => toggleSegmentEnabled("last", useLastCheckbox.checked));
 }
 
 // 快捷键：Ctrl/Cmd+Z 撤回，Ctrl/Cmd+Y 或 Ctrl/Cmd+Shift+Z 重做
@@ -1137,6 +1404,7 @@ document.addEventListener("keydown", (e) => {
     redo();
   }
 });
+
 
 // ==================== 导出时间列表 ====================
 function dateToLocalInputValue(d) {
@@ -1259,8 +1527,8 @@ const Backend = (function () {
 
 // ==================== 生成 FIT ====================
 async function generateFit() {
-  if (routePoints.length < 2) {
-    updateMessage("请至少在地图上选择两个点形成轨迹", true);
+  if (segments.main.length < 2) {
+    updateMessage("请至少在地图上选择两个点形成主路线", true);
     return;
   }
 
@@ -1294,7 +1562,9 @@ async function generateFit() {
     return;
   }
 
-  const wgsPoints = convertRoutePointsToWgs84();
+  const wgsPoints = convertPointsToWgs84(segments.main);
+  const wgsFirstLap = segmentUsable("first") ? convertPointsToWgs84(segments.first) : null;
+  const wgsLastLap = segmentUsable("last") ? convertPointsToWgs84(segments.last) : null;
 
   try {
     for (let i = 0; i < exportCount; i++) {
@@ -1328,6 +1598,8 @@ async function generateFit() {
         result = await Backend.generate({
           startTime: fileStart.toISOString(),
           points: wgsPoints,
+          firstLapPoints: wgsFirstLap,
+          lastLapPoints: wgsLastLap,
           paceSecondsPerKm,
           hrRest,
           hrMax,
@@ -1372,7 +1644,7 @@ function applyRouteMode() {
   if (lapCountGroup) {
     lapCountGroup.style.display = routeMode === "loop" ? "" : "none";
   }
-  refreshPolyline();
+  renderRoute();
   updateDistanceInfo();
 }
 
@@ -1384,8 +1656,8 @@ updateDistanceInfo();
 rebuildExportTimes();
 
 async function previewActivity() {
-  if (routePoints.length < 2) {
-    updateMessage("请至少在地图上选择两个点形成轨迹", true);
+  if (segments.main.length < 2) {
+    updateMessage("请至少在地图上选择两个点形成主路线", true);
     return;
   }
 
@@ -1438,7 +1710,9 @@ async function previewActivity() {
     try {
       data = await Backend.preview({
         startTime: start.toISOString(),
-        points: convertRoutePointsToWgs84(),
+        points: convertPointsToWgs84(segments.main),
+        firstLapPoints: segmentUsable("first") ? convertPointsToWgs84(segments.first) : null,
+        lastLapPoints: segmentUsable("last") ? convertPointsToWgs84(segments.last) : null,
         paceSecondsPerKm,
         hrRest,
         hrMax,

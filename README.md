@@ -1,4 +1,4 @@
-# Fit Tool v1.6 · Web Edition
+# Fit Tool v1.7 · Web Edition
 
 **English** | [Chinese](README-zh.md)
 
@@ -18,7 +18,8 @@ Plan a running route (e.g. a campus loop), then export a realistic FIT file with
 - **Undo / redo** — `Ctrl+Z` / `Ctrl+Y` (or `Ctrl+Shift+Z`). Works for adding points, dragging a vertex, panning the whole route, clearing it, switching map sources and importing a route. 80 steps of history.
 - **Drag any vertex** — click and drag the orange handle; the line and the total distance update live. Coordinates are clamped to valid ranges, so you can never produce broken data.
 - **Pan the whole route** — press and drag the line itself to move every vertex at once. Releasing does not accidentally add a new point.
-- **Save / load routes** — export as GeoJSON (includes route mode, lap count and offset), import GeoJSON (`Feature`, `FeatureCollection`, `LineString`, `MultiLineString`, `Polygon`), the legacy `{points:[{lat,lng}]}` shape, or a plain `[[lng,lat],...]` array. Invalid files are rejected with a message and never touch your current route.
+- **Custom first / last lap** — switch the drawing tab to *First lap* or *Last lap* and draw a different shape for that lap. Use it when the start and finish are not at the same spot: the first lap and the last lap replace one loop each, while all laps in between keep the main route. Each custom lap can be toggled off independently.
+- **Save / load routes** — export as GeoJSON (includes the main route plus the optional first/last lap, route mode, lap count and offset), import GeoJSON (`Feature`, `FeatureCollection`, `LineString`, `MultiLineString`, `Polygon`), the legacy `{points:[{lat,lng}]}` shape, or a plain `[[lng,lat],...]` array. Invalid files are rejected with a message and never touch your current route.
 
 ### Activity generation
 
