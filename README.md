@@ -1,6 +1,6 @@
 # Fit Tool v1.6 · Web Edition
 
-**English** | [中文说明](README-zh.md)
+**English** | [Chinese](README-zh.md)
 
 Draw a route on the map, drag its vertices, tune the GPS drift, and generate a Garmin **FIT** activity file — entirely in your browser. No backend, no install.
 
