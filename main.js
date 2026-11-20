@@ -121,6 +121,9 @@ const map = L.map("map", {
   maxBoundsViscosity: 1.0 // 1.0 = 硬边界
 }).setView([26.083719, 119.246678], 13);
 
+// 双击线段用来插入结点，关掉双击缩放避免冲突
+if (map.doubleClickZoom && map.doubleClickZoom.disable) map.doubleClickZoom.disable();
+
 // ==================== 坐标转换（GCJ-02 <-> WGS-84） ====================
 const GCJ_A = 6378245.0;
 const GCJ_EE = 0.00669342162296594323;
@@ -174,11 +177,9 @@ let currentSourceId = "tianditu";
 let coordConvertEnabled = false;
 
 // 轨迹与预览状态
-// 路线分成三段：main（主路线，所有中间圈都用它）、first（首圈）、last（尾圈）
-// 首圈 / 尾圈是可选的，用来模拟起点终点不在同一个位置的真实跑步轨迹。
-// 路线 = 起跑段（不闭合）+ 主路线 × 圈数 + 收尾段（不闭合）
+// 路线 = 首圈（从起点接进主路线）+ 主路线 × 圈数 + 尾圈（从主路线接到终点）
 const SEGMENT_KEYS = ["main", "start", "end"];
-const SEGMENT_LABELS = { main: "主路线", start: "起跑段", end: "收尾段" };
+const SEGMENT_LABELS = { main: "主路线", start: "首圈", end: "尾圈" };
 const SEGMENT_COLORS = { main: "#ff5722", start: "#16a34a", end: "#2563eb" };
 const segments = { main: [], start: [], end: [] };
 const segmentEnabled = { start: false, end: false };
@@ -188,11 +189,22 @@ let activeSegment = "main";
 let routeMode = "loop"; // "loop" 环形（自动闭合）/ "linear" 线性（不闭合）
 let previewData = null;
 let previewTimer = null;
-let previewIndex = 0;
 let previewMarker = null;
-let previewTrace = null;
 
-// 路线编辑状态：撤回栈 / 结点标记 / 拖动状态
+// 预览状态：只画走过的路段，按速度渐变上色
+let previewMode = false;
+let previewRate = 15;
+let previewTicks = 0;
+let previewSamples = [];
+let previewTotalTime = 0;
+let previewElapsed = 0;
+let previewCursor = 0;
+let previewSpeedMin = 0;
+let previewSpeedMax = 1;
+let previewTrail = null;
+let previewTrailPoints = [];
+
+// 路线编辑状态：撤回栈 / 结点标记 / 拖动 / 选中 / 剪切
 const HISTORY_LIMIT = 80;
 const undoStack = [];
 const redoStack = [];
@@ -200,6 +212,9 @@ let vertexMarkers = [];
 let dragSnapshot = null;
 let isDraggingRoute = false;
 let isDraggingVertex = false;
+let selectedVertexIndex = -1;
+let cutMode = false;
+let cutFirstIndex = -1;
 // 平移结束后浏览器还会补发一次 click，用它把这一个 click 吞掉，避免多加点
 let suppressMapClickUntil = 0;
 
@@ -233,21 +248,17 @@ function buildLayerUrl(source, template, key) {
   return template.replace("{key}", key ? "&key=" + encoded : "");
 }
 
+// 编辑动作会清掉遗留的预览覆盖物（不会改变预览模式本身）
 function clearPreviewOverlay() {
   if (previewMarker) {
     map.removeLayer(previewMarker);
     previewMarker = null;
   }
-  if (previewTrace) {
-    map.removeLayer(previewTrace);
-    previewTrace = null;
-  }
-  if (previewTimer) {
+  if (previewTimer && !previewMode) {
     clearInterval(previewTimer);
     previewTimer = null;
   }
   previewData = null;
-  previewIndex = 0;
 }
 
 function clearRoute(options) {
@@ -256,12 +267,14 @@ function clearRoute(options) {
   if (opts.recordHistory !== false && hasAny) {
     pushHistory();
   }
+  if (previewMode) exitPreviewMode();
   SEGMENT_KEYS.forEach((key) => {
     segments[key] = [];
   });
   segmentEnabled.start = false;
   segmentEnabled.end = false;
   activeSegment = "main";
+  resetEditingSelection();
   removeAllVertices();
   SEGMENT_KEYS.forEach((key) => {
     if (polylines[key]) {
@@ -623,14 +636,22 @@ function segmentDistanceMeters(segmentKey) {
   return computeDistanceMeters(segmentDisplayPoints(segmentKey));
 }
 
-// 总距离 = 起跑段 + 主路线 × 圈数 + 收尾段
+// 总距离：圈数 = 总圈数；首圈替换第 1 圈，尾圈替换最后一圈，其余用主路线
 function computeTotalDistanceMeters() {
   const laps = getLapCount();
   const mainMeters = segmentDistanceMeters("main");
   if (routeMode !== "loop") return mainMeters;
-  let total = mainMeters * Math.max(1, laps);
-  if (segmentUsable("start")) total += segmentDistanceMeters("start");
-  if (segmentUsable("end")) total += segmentDistanceMeters("end");
+  const useFirst = segmentUsable("start");
+  const useLast = segmentUsable("end");
+  if (laps <= 1) {
+    if (useFirst) return segmentDistanceMeters("start");
+    if (useLast) return segmentDistanceMeters("end");
+    return mainMeters;
+  }
+  const middle = Math.max(0, laps - (useFirst ? 1 : 0) - (useLast ? 1 : 0));
+  let total = mainMeters * middle;
+  if (useFirst) total += segmentDistanceMeters("start");
+  if (useLast) total += segmentDistanceMeters("end");
   return total;
 }
 
@@ -645,17 +666,26 @@ function updateDistanceInfo() {
   }
   const totalKm = (computeTotalDistanceMeters() / 1000).toFixed(2);
   if (routeMode === "loop") {
+    const useFirst = segmentUsable("start");
+    const useLast = segmentUsable("end");
     const parts = [];
-    if (segmentUsable("start")) parts.push(`起跑 ${(segmentDistanceMeters("start") / 1000).toFixed(2)}`);
-    parts.push(`主路线 ${(mainMeters / 1000).toFixed(2)} × ${laps} 圈`);
-    if (segmentUsable("end")) parts.push(`收尾 ${(segmentDistanceMeters("end") / 1000).toFixed(2)}`);
-    el.textContent = `总距离约：${totalKm} 公里（${parts.join(" + ")}）`;
+    if (laps <= 1) {
+      if (useFirst) parts.push(`首圈 ${(segmentDistanceMeters("start") / 1000).toFixed(2)}`);
+      else if (useLast) parts.push(`尾圈 ${(segmentDistanceMeters("end") / 1000).toFixed(2)}`);
+      else parts.push(`主路线 ${(mainMeters / 1000).toFixed(2)}`);
+    } else {
+      const middle = Math.max(0, laps - (useFirst ? 1 : 0) - (useLast ? 1 : 0));
+      if (useFirst) parts.push(`首圈 ${(segmentDistanceMeters("start") / 1000).toFixed(2)}`);
+      if (middle > 0) parts.push(`主路线 ${(mainMeters / 1000).toFixed(2)} × ${middle} 圈`);
+      if (useLast) parts.push(`尾圈 ${(segmentDistanceMeters("end") / 1000).toFixed(2)}`);
+    }
+    el.textContent = `总距离约：${totalKm} 公里（${parts.join(" + ")}，共 ${laps} 圈）`;
   } else {
     el.textContent = `总距离约：${totalKm} 公里`;
   }
 }
 
-// ==================== 路线编辑：起跑段 / 主路线 / 收尾段 + 撤回 / 拖动 / 平移 / 导入导出 ====================
+// ==================== 路线编辑：分段 / 撤回 / 结点拖动 / 插入 / 剪切 / 平移 / 导入导出 ====================
 function clonePoints(points) {
   return (points || []).map((p) => ({ lat: p.lat, lng: p.lng }));
 }
@@ -681,7 +711,22 @@ function samePoints(a, b) {
   return true;
 }
 
-// ---------- 撤回栈（快照：三段点集 + 启用状态；不记录当前编辑段，避免撤回时跳标签） ----------
+// 点到线段的近似距离（米），用于"双击在最近的线段上插点"
+function pointSegmentDistanceMeters(point, a, b) {
+  const metersPerDegLat = 111320;
+  const metersPerDegLng = 111320 * Math.cos((a.lat * Math.PI) / 180);
+  const px = (point.lng - a.lng) * metersPerDegLng;
+  const py = (point.lat - a.lat) * metersPerDegLat;
+  const vx = (b.lng - a.lng) * metersPerDegLng;
+  const vy = (b.lat - a.lat) * metersPerDegLat;
+  const len2 = vx * vx + vy * vy;
+  const t = len2 > 0 ? Math.max(0, Math.min(1, (px * vx + py * vy) / len2)) : 0;
+  const dx = px - vx * t;
+  const dy = py - vy * t;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+// ---------- 撤回栈（快照：三段点集 + 启用状态；不记录当前编辑段） ----------
 function snapshotState() {
   return {
     enabled: { start: Boolean(segmentEnabled.start), end: Boolean(segmentEnabled.end) },
@@ -737,7 +782,7 @@ function undo() {
   }
   redoStack.push(snapshotState());
   applySnapshot(undoStack.pop());
-  clearPreviewOverlay();
+  resetEditingSelection();
   syncSegmentUi();
   renderRoute();
   updateMessage("已撤回（Ctrl+Y 重做）");
@@ -753,14 +798,26 @@ function redo() {
   undoStack.push(snapshotState());
   if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
   applySnapshot(redoStack.pop());
-  clearPreviewOverlay();
+  resetEditingSelection();
   syncSegmentUi();
   renderRoute();
   updateMessage("已重做");
   return true;
 }
 
+function resetEditingSelection() {
+  selectedVertexIndex = -1;
+  cutMode = false;
+  cutFirstIndex = -1;
+}
+
 // ---------- 分段界面 ----------
+function showElement(id, visible) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.style.display = visible ? "" : "none";
+}
+
 function syncSegmentUi() {
   const tabs = document.querySelectorAll("[data-segment]");
   Array.prototype.forEach.call(tabs, (button) => {
@@ -777,15 +834,38 @@ function syncSegmentUi() {
   const clearButton = document.getElementById("clearRoute");
   if (clearButton) clearButton.textContent = "清除" + SEGMENT_LABELS[activeSegment];
 
+  const points = segments[activeSegment];
+  const isSide = activeSegment !== "main";
+  showElement("copyMainBtn", isSide && points.length < 2);
+  showElement("cutBtn", isSide && points.length >= 3);
+  showElement("deleteVertexBtn", points.length >= 1);
+  showElement("toggleEndBtn", isSide && points.length >= 2);
+
+  const toggleButton = document.getElementById("toggleEndBtn");
+  if (toggleButton) {
+    toggleButton.textContent = activeSegment === "end" ? "终点换到另一端" : "起点换到另一端";
+  }
+  const cutButton = document.getElementById("cutBtn");
+  if (cutButton) {
+    cutButton.classList.toggle("active", cutMode);
+    cutButton.textContent = cutMode ? "剪切中…点两个结点" : "剪切两点间";
+  }
+
   const hint = document.getElementById("segmentHint");
   if (hint) {
     let text;
-    if (activeSegment === "main") {
-      text = "主路线是整圈，圈数决定跑几圈；起跑段 / 收尾段是从起点进场、出场到终点的连接线。";
-    } else if (routeMode !== "loop") {
-      text = "线性模式下不使用起跑段 / 收尾段。";
+    if (previewMode) {
+      text = "预览中：编辑工具暂不可用，点「退出预览」回到编辑。";
+    } else if (activeSegment === "main") {
+      text = "圈数 = 总圈数；首圈替换第 1 圈、尾圈替换最后一圈，其余用主路线。双击线段可加点，拖圆点改形状。";
+    } else if (points.length < 2) {
+      text = `点「从主路线复制」把主路线形状拿来改，或用「${SEGMENT_LABELS[activeSegment]}」标签在地图上直接画。`;
+    } else if (cutMode) {
+      text = "剪切模式：依次点两个结点，会删掉它们之间较短的一段。";
     } else {
-      text = `${SEGMENT_LABELS[activeSegment]}是一段不闭合的连接线，按顺序画：${activeSegment === "start" ? "起点 → 跑道" : "跑道 → 终点"}。`;
+      text = activeSegment === "start"
+        ? "首圈替换第 1 圈：终点会自动接到主路线，起点用「起点换到另一端」决定是哪一头。"
+        : "尾圈替换最后一圈：起点会自动接到主路线，终点用「终点换到另一端」决定是哪一头。";
     }
     hint.textContent = text;
   }
@@ -796,8 +876,10 @@ function switchSegment(key) {
     syncSegmentUi();
     return;
   }
+  if (previewMode) exitPreviewMode();
   activeSegment = key;
   if (key !== "main") segmentEnabled[key] = true;
+  resetEditingSelection();
   clearPreviewOverlay();
   renderRoute();
   updateMessage(`正在编辑${SEGMENT_LABELS[key]}（${segments[key].length} 个结点）`);
@@ -806,6 +888,7 @@ function switchSegment(key) {
 function toggleSegmentEnabled(key, enabled) {
   if (key !== "start" && key !== "end") return;
   if (Boolean(segmentEnabled[key]) === Boolean(enabled)) return;
+  if (previewMode) exitPreviewMode();
   pushHistory();
   segmentEnabled[key] = Boolean(enabled);
   clearPreviewOverlay();
@@ -815,6 +898,161 @@ function toggleSegmentEnabled(key, enabled) {
       ? `已启用${SEGMENT_LABELS[key]}（${segments[key].length} 个结点）`
       : `已关闭${SEGMENT_LABELS[key]}`
   );
+}
+
+// 把主路线复制到首圈 / 尾圈，作为修改的起点
+function copyMainToActiveSegment() {
+  if (activeSegment === "main") return;
+  if (segments.main.length < 2) {
+    updateMessage("先画好主路线再复制", true);
+    return;
+  }
+  if (previewMode) exitPreviewMode();
+  pushHistory();
+  segments[activeSegment] = clonePoints(segments.main);
+  segmentEnabled[activeSegment] = true;
+  resetEditingSelection();
+  clearPreviewOverlay();
+  renderRoute();
+  updateMessage(
+    `已把主路线复制到${SEGMENT_LABELS[activeSegment]}：剪切缺口、拖两端、双击线加结点来改形状`
+  );
+}
+
+// 反转方向：起点 / 终点换到另一端
+function reverseActiveSegment() {
+  if (activeSegment === "main") return;
+  const points = segments[activeSegment];
+  if (points.length < 2) return;
+  if (previewMode) exitPreviewMode();
+  pushHistory();
+  segments[activeSegment] = points.slice().reverse();
+  resetEditingSelection();
+  clearPreviewOverlay();
+  renderRoute();
+  updateMessage(
+    activeSegment === "start" ? "首圈起点已换到另一端" : "尾圈终点已换到另一端"
+  );
+}
+
+// 删除选中的结点
+function deleteSelectedVertex() {
+  if (previewMode) return;
+  if (selectedVertexIndex < 0 || selectedVertexIndex >= segments[activeSegment].length) {
+    updateMessage("先点一个结点选中，再删除", true);
+    return;
+  }
+  pushHistory();
+  segments[activeSegment].splice(selectedVertexIndex, 1);
+  resetEditingSelection();
+  clearPreviewOverlay();
+  renderRoute();
+  updateMessage("已删除结点（Ctrl+Z 撤回）");
+}
+
+// 线段中间插入结点（双击线）
+function insertVertexAt(latlng) {
+  if (previewMode) return;
+  const points = segments[activeSegment];
+  if (!points.length) return;
+  pushHistory();
+  if (points.length === 1) {
+    points.push(clampPoint(latlng));
+  } else {
+    const closed = activeSegment === "main" && routeMode === "loop";
+    const n = points.length;
+    const edges = closed ? n : n - 1;
+    let bestEdge = 0;
+    let bestDistance = Infinity;
+    for (let i = 0; i < edges; i++) {
+      const a = points[i];
+      const b = points[(i + 1) % n];
+      const d = pointSegmentDistanceMeters(latlng, a, b);
+      if (d < bestDistance) {
+        bestDistance = d;
+        bestEdge = i;
+      }
+    }
+    points.splice(bestEdge + 1, 0, clampPoint(latlng));
+  }
+  resetEditingSelection();
+  clearPreviewOverlay();
+  renderRoute();
+  updateMessage("已在线段中间插入结点（Ctrl+Z 撤回）");
+}
+
+// 剪切两点之间较短的一段，保留其余部分；两端变成新的端点
+function cutBetween(indexA, indexB) {
+  const points = segments[activeSegment];
+  const n = points.length;
+  if (n < 3 || indexA === indexB) return false;
+
+  const forward = [];
+  for (let k = indexA; ; k = (k + 1) % n) {
+    forward.push(k);
+    if (k === indexB) break;
+  }
+  const backward = [];
+  for (let k = indexB; ; k = (k + 1) % n) {
+    backward.push(k);
+    if (k === indexA) break;
+  }
+  const kept = forward.length <= backward.length ? backward : forward;
+  segments[activeSegment] = kept.map((k) => points[k]);
+  return true;
+}
+
+// ---------- 结点交互 ----------
+function handleVertexClick(index) {
+  if (previewMode) return;
+  if (cutMode) {
+    if (cutFirstIndex < 0) {
+      cutFirstIndex = index;
+      renderVertices();
+      updateMessage(`已选中第 ${index + 1} 个结点，再点第二个结点完成剪切`);
+      return;
+    }
+    if (cutFirstIndex === index) {
+      cutFirstIndex = -1;
+      renderVertices();
+      updateMessage("请点另一个结点");
+      return;
+    }
+    pushHistory();
+    const ok = cutBetween(cutFirstIndex, index);
+    resetEditingSelection();
+    if (ok) {
+      clearPreviewOverlay();
+      renderRoute();
+      updateMessage(`已删掉两点之间较短的一段，现在有 ${segments[activeSegment].length} 个结点`);
+    } else {
+      renderRoute();
+      updateMessage("这部分不能剪切", true);
+    }
+    return;
+  }
+
+  selectedVertexIndex = selectedVertexIndex === index ? -1 : index;
+  renderVertices();
+  if (selectedVertexIndex >= 0) {
+    updateMessage(`已选中第 ${index + 1} 个结点（可拖动、可删除）`);
+  } else {
+    updateMessage("已取消选择");
+  }
+}
+
+function toggleCutMode() {
+  if (previewMode) return;
+  if (activeSegment === "main") {
+    updateMessage("主路线是整圈，不能剪切；先复制到首圈/尾圈再改", true);
+    return;
+  }
+  cutMode = !cutMode;
+  cutFirstIndex = -1;
+  selectedVertexIndex = -1;
+  renderVertices();
+  syncSegmentUi();
+  updateMessage(cutMode ? "剪切模式：依次点两个结点" : "已退出剪切模式");
 }
 
 // ---------- 绘制 ----------
@@ -854,17 +1092,32 @@ function ensureSegmentPolyline(segmentKey) {
   if (existing) removePolyline(segmentKey);
   const layer = L.polyline(segmentDisplayPoints(segmentKey), polylineOptions(segmentKey)).addTo(map);
   layer._fitActive = isActive;
-  if (isActive) layer.on("mousedown", onRouteLineMouseDown);
+  if (isActive) {
+    layer.on("mousedown", onRouteLineMouseDown);
+    layer.on("dblclick", (e) => {
+      if (e.originalEvent && L.DomEvent && L.DomEvent.stop) L.DomEvent.stop(e.originalEvent);
+      if (e.originalEvent && e.originalEvent.preventDefault) e.originalEvent.preventDefault();
+      insertVertexAt(e.latlng);
+    });
+  }
   polylines[segmentKey] = layer;
 }
 
-function vertexIcon() {
+function vertexIcon(kind) {
   return L.divIcon({
-    className: "route-vertex",
+    className: "route-vertex route-vertex-" + kind,
     html: "<span></span>",
     iconSize: [16, 16],
     iconAnchor: [8, 8]
   });
+}
+
+function vertexKind(index) {
+  if (cutFirstIndex === index) return "cut";
+  if (selectedVertexIndex === index) return "selected";
+  if (activeSegment === "start" && index === 0) return "head";
+  if (activeSegment === "end" && index === segments.end.length - 1) return "tail";
+  return "normal";
 }
 
 function createVertexMarker(index) {
@@ -875,9 +1128,11 @@ function createVertexMarker(index) {
     keyboard: false,
     autoPan: true,
     zIndexOffset: 1000,
-    icon: vertexIcon(),
-    title: `${SEGMENT_LABELS[activeSegment]} 结点 ${index + 1}（拖动可移动）`
+    icon: vertexIcon(vertexKind(index)),
+    title: `${SEGMENT_LABELS[activeSegment]} 结点 ${index + 1}`
   });
+
+  marker.on("click", () => handleVertexClick(index));
 
   marker.on("dragstart", () => {
     clearPreviewOverlay();
@@ -904,10 +1159,12 @@ function createVertexMarker(index) {
       undoStack.pop();
       updateHistoryButtons();
     } else {
+      selectedVertexIndex = index;
       updateMessage(`已移动${SEGMENT_LABELS[activeSegment]}结点 ${index + 1}（Ctrl+Z 撤回）`);
     }
     const layer = polylines[activeSegment];
     if (layer) layer.setLatLngs(segmentDisplayPoints(activeSegment));
+    renderVertices();
     updateDistanceInfo();
   });
 
@@ -957,7 +1214,7 @@ function refreshActiveSegmentGeometry() {
 
 // ---------- 整条平移（只平移当前编辑的分段） ----------
 function onRouteLineMouseDown(e) {
-  if (isDraggingRoute) return;
+  if (previewMode || isDraggingRoute) return;
   const points = segments[activeSegment];
   if (points.length < 2) return;
   if (e.originalEvent && typeof e.originalEvent.button === "number" && e.originalEvent.button !== 0) {
@@ -1056,7 +1313,7 @@ function buildRouteExportData() {
     type: "FeatureCollection",
     properties: {
       name: "Fit Tool route",
-      tool: "Fit Tool v1.8",
+      tool: "Fit Tool v2.0",
       routeMode,
       lapCount: getLapCount(),
       routeOffset: getRouteOffset(),
@@ -1108,7 +1365,6 @@ function coordinatesToPoints(coordinates) {
   return points;
 }
 
-// 兼容 GeoJSON（Feature / FeatureCollection / LineString / MultiLineString / Polygon）与旧版 JSON
 function extractRoutePoints(data) {
   if (!data) return null;
   if (Array.isArray(data)) {
@@ -1167,7 +1423,6 @@ function validateImportedPoints(points) {
   return cleaned;
 }
 
-// 旧版导出把连接段叫 first / last，这里做一次映射
 function normalizeSegmentName(name) {
   if (name === "start" || name === "first") return "start";
   if (name === "end" || name === "last") return "end";
@@ -1175,7 +1430,6 @@ function normalizeSegmentName(name) {
   return null;
 }
 
-// 解析成 { main, start, end, enabled, props }
 function extractRouteSegments(data) {
   const result = {
     main: [],
@@ -1231,6 +1485,7 @@ function fitViewToRoute() {
 }
 
 function importRouteFromText(text) {
+  if (previewMode) exitPreviewMode();
   let data;
   try {
     data = JSON.parse(text);
@@ -1239,7 +1494,6 @@ function importRouteFromText(text) {
   }
 
   const parsed = extractRouteSegments(data);
-  // 只有单独一条线时，当成主路线
   if (!parsed.main.length && parsed.start.length && !parsed.end.length) {
     parsed.main = parsed.start;
     parsed.start = [];
@@ -1266,6 +1520,7 @@ function importRouteFromText(text) {
   segmentEnabled.start = segments.start.length >= 2 && parsed.enabled.start;
   segmentEnabled.end = segments.end.length >= 2 && parsed.enabled.end;
   activeSegment = "main";
+  resetEditingSelection();
 
   const props = parsed.props || {};
   if (props.routeMode === "loop" || props.routeMode === "linear") {
@@ -1290,8 +1545,8 @@ function importRouteFromText(text) {
   renderRoute();
   fitViewToRoute();
   const parts = [`主路线 ${segments.main.length} 点`];
-  if (segments.start.length >= 2) parts.push(`起跑段 ${segments.start.length} 点`);
-  if (segments.end.length >= 2) parts.push(`收尾段 ${segments.end.length} 点`);
+  if (segments.start.length >= 2) parts.push(`首圈 ${segments.start.length} 点`);
+  if (segments.end.length >= 2) parts.push(`尾圈 ${segments.end.length} 点`);
   updateMessage(`已导入路线：${parts.join(" / ")}`);
 }
 
@@ -1312,6 +1567,7 @@ function readFileAsText(file) {
 }
 
 function clearActiveSegment() {
+  if (previewMode) return;
   const key = activeSegment;
   if (!segments[key].length) {
     updateMessage(`${SEGMENT_LABELS[key]}已经是空的`);
@@ -1320,12 +1576,14 @@ function clearActiveSegment() {
   pushHistory();
   segments[key] = [];
   if (key !== "main") segmentEnabled[key] = false;
+  resetEditingSelection();
   clearPreviewOverlay();
   renderRoute();
   updateMessage(`已清除${SEGMENT_LABELS[key]}（Ctrl+Z 可恢复）`);
 }
 
 map.on("click", (e) => {
+  if (previewMode) return;
   if (Date.now() < suppressMapClickUntil) {
     suppressMapClickUntil = 0;
     return;
@@ -1334,6 +1592,7 @@ map.on("click", (e) => {
   clearPreviewOverlay();
   segments[activeSegment].push(clampPoint({ lat: e.latlng.lat, lng: e.latlng.lng }));
   if (activeSegment !== "main") segmentEnabled[activeSegment] = true;
+  resetEditingSelection();
   renderRoute();
   updateMessage(
     `已添加${SEGMENT_LABELS[activeSegment]}结点：${segments[activeSegment].length}（Ctrl+Z 撤回）`
@@ -1376,25 +1635,45 @@ Array.prototype.forEach.call(segmentTabs, (button) => {
 
 const useStartCheckbox = document.getElementById("useStartSegment");
 if (useStartCheckbox) {
-  useStartCheckbox.addEventListener("change", () => toggleSegmentEnabled("start", useStartCheckbox.checked));
+  useStartCheckbox.addEventListener("change", () =>
+    toggleSegmentEnabled("start", useStartCheckbox.checked)
+  );
 }
 const useEndCheckbox = document.getElementById("useEndSegment");
 if (useEndCheckbox) {
   useEndCheckbox.addEventListener("change", () => toggleSegmentEnabled("end", useEndCheckbox.checked));
 }
 
-// 快捷键：Ctrl/Cmd+Z 撤回，Ctrl/Cmd+Y 或 Ctrl/Cmd+Shift+Z 重做
+const copyMainBtn = document.getElementById("copyMainBtn");
+if (copyMainBtn) copyMainBtn.addEventListener("click", () => copyMainToActiveSegment());
+const cutBtn = document.getElementById("cutBtn");
+if (cutBtn) cutBtn.addEventListener("click", () => toggleCutMode());
+const deleteVertexBtn = document.getElementById("deleteVertexBtn");
+if (deleteVertexBtn) deleteVertexBtn.addEventListener("click", () => deleteSelectedVertex());
+const toggleEndBtn = document.getElementById("toggleEndBtn");
+if (toggleEndBtn) toggleEndBtn.addEventListener("click", () => reverseActiveSegment());
+
+// 快捷键：Ctrl/Cmd+Z 撤回，Ctrl/Cmd+Y 重做，Delete 删除选中结点
 document.addEventListener("keydown", (e) => {
   const target = e.target;
   const tag = target && target.tagName ? String(target.tagName).toLowerCase() : "";
   const isEditable =
-    tag === "input" ||
-    tag === "textarea" ||
-    tag === "select" ||
-    (target && target.isContentEditable);
+    tag === "input" || tag === "textarea" || tag === "select" || (target && target.isContentEditable);
   if (isEditable) return;
-  if (!(e.ctrlKey || e.metaKey)) return;
   const key = String(e.key || "").toLowerCase();
+  if (key === "escape" && previewMode) {
+    e.preventDefault();
+    exitPreviewMode();
+    return;
+  }
+  if (key === "delete" || key === "backspace") {
+    if (selectedVertexIndex >= 0 && !previewMode) {
+      e.preventDefault();
+      deleteSelectedVertex();
+    }
+    return;
+  }
+  if (!(e.ctrlKey || e.metaKey)) return;
   if (key === "z" && !e.shiftKey) {
     e.preventDefault();
     undo();
@@ -1403,7 +1682,6 @@ document.addEventListener("keydown", (e) => {
     redo();
   }
 });
-
 
 // ==================== 导出时间列表 ====================
 function dateToLocalInputValue(d) {
@@ -1654,6 +1932,311 @@ applyRouteMode();
 updateDistanceInfo();
 rebuildExportTimes();
 
+// ==================== 预览：只画走过的路段，按速度渐变上色 ====================
+// 速度颜色：慢 = 红，中 = 橙，快 = 绿（按本次跑步的速度范围取色）
+function speedColor(speed, minSpeed, maxSpeed) {
+  const range = maxSpeed - minSpeed;
+  let t;
+  if (!(range > 0.05)) {
+    t = 0.5;
+  } else {
+    t = Math.max(0, Math.min(1, (speed - minSpeed) / range));
+  }
+  const slow = [239, 68, 68]; // 红
+  const mid = [245, 158, 11]; // 橙
+  const fast = [34, 197, 94]; // 绿
+  let from;
+  let to;
+  let k;
+  if (t < 0.5) {
+    from = slow;
+    to = mid;
+    k = t / 0.5;
+  } else {
+    from = mid;
+    to = fast;
+    k = (t - 0.5) / 0.5;
+  }
+  const mix = (i) => Math.round(from[i] + (to[i] - from[i]) * k);
+  return `rgb(${mix(0)}, ${mix(1)}, ${mix(2)})`;
+}
+
+// 滑块控制「整段轨迹用多少秒播完」，播放倍速 = 总时长 / 目标秒数
+function getPreviewTargetSeconds() {
+  const input = document.getElementById("previewRate");
+  const value = input ? Number(input.value) : previewRate;
+  return Number.isFinite(value) && value >= 3 ? value : 15;
+}
+
+function getPreviewRate() {
+  if (!(previewTotalTime > 0)) return 60;
+  return Math.max(0.2, previewTotalTime / getPreviewTargetSeconds());
+}
+
+function syncPreviewRateLabel() {
+  const label = document.getElementById("previewRateValue");
+  if (!label) return;
+  const target = getPreviewTargetSeconds();
+  if (previewTotalTime > 0) {
+    label.textContent = `${target} 秒（约 ${Math.round(previewTotalTime / target)}×）`;
+  } else {
+    label.textContent = `${target} 秒`;
+  }
+}
+
+// 画布图层：把已跑过的点按速度颜色连成线
+function createTrailLayer() {
+  const TrailLayer = L.Layer.extend({
+    initialize() {
+      this._points = [];
+      this._canvas = null;
+      this._map = null;
+    },
+    onAdd(map) {
+      this._map = map;
+      const canvas = L.DomUtil.create("canvas", "leaflet-trail-layer");
+      canvas.style.position = "absolute";
+      canvas.style.pointerEvents = "none";
+      map.getPanes().overlayPane.appendChild(canvas);
+      this._canvas = canvas;
+      map.on("move moveend zoomend viewreset resize", this._reset, this);
+      this._reset();
+    },
+    onRemove(map) {
+      map.off("move moveend zoomend viewreset resize", this._reset, this);
+      if (this._canvas && this._canvas.parentNode) {
+        this._canvas.parentNode.removeChild(this._canvas);
+      }
+      this._canvas = null;
+      this._map = null;
+    },
+    setPoints(points) {
+      this._points = points || [];
+      this.redraw();
+    },
+    _reset() {
+      if (!this._map || !this._canvas) return;
+      const size = this._map.getSize();
+      const topLeft = this._map.containerPointToLayerPoint([0, 0]);
+      if (L.DomUtil.setPosition) L.DomUtil.setPosition(this._canvas, topLeft);
+      this._canvas.width = size.x;
+      this._canvas.height = size.y;
+      this._canvas.style.width = size.x + "px";
+      this._canvas.style.height = size.y + "px";
+      this.redraw();
+    },
+    redraw() {
+      const canvas = this._canvas;
+      if (!canvas || !canvas.getContext) return;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const points = this._points;
+      if (!points || points.length < 2) return;
+      ctx.lineWidth = 5;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      for (let i = 1; i < points.length; i++) {
+        const a = this._map.latLngToContainerPoint(points[i - 1].latlng);
+        const b = this._map.latLngToContainerPoint(points[i].latlng);
+        ctx.strokeStyle = points[i].color;
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      }
+    }
+  });
+  return new TrailLayer();
+}
+
+function hideEditingLayers() {
+  SEGMENT_KEYS.forEach((key) => removePolyline(key));
+  removeAllVertices();
+}
+
+// 预览模式是否处于「可退出」状态与动画是否在跑无关：只要还在预览里，退出按钮就可用
+function setPreviewButtons() {
+  const previewButton = document.getElementById("previewBtn");
+  if (previewButton) previewButton.textContent = previewMode ? "重新预览" : "预览";
+  const exitButton = document.getElementById("exitPreviewBtn");
+  if (exitButton) exitButton.disabled = !previewMode;
+}
+
+function stopPreviewTimer() {
+  if (previewTimer) {
+    clearInterval(previewTimer);
+    previewTimer = null;
+  }
+}
+
+function updatePreviewInfo(sample) {
+  const el = document.getElementById("liveInfo");
+  if (!el || !sample) return;
+  const t = Math.max(0, sample.timeSec || 0);
+  const min = Math.floor(t / 60);
+  const sec = Math.floor(t % 60);
+  const speed = sample.speed > 0 ? sample.speed : 0.01;
+  const secPerKm = 1000 / speed;
+  const paceMin = Math.floor(secPerKm / 60);
+  const paceSec = Math.round(secPerKm % 60);
+  const km = ((sample.distance || 0) / 1000).toFixed(2);
+  el.textContent =
+    `${min}:${String(sec).padStart(2, "0")}  距离 ${km} km  ` +
+    `配速 ${paceMin}'${String(paceSec).padStart(2, "0")}/km  心率 ${sample.heartRate || 0} bpm`;
+}
+
+function syncPreviewTo(timeSec) {
+  if (!previewSamples.length) return;
+  let index = previewCursor;
+  while (index + 1 < previewSamples.length && previewSamples[index + 1].timeSec <= timeSec) {
+    index += 1;
+  }
+  if (index > previewCursor) {
+    for (let i = previewCursor + 1; i <= index; i++) {
+      const sample = previewSamples[i];
+      previewTrailPoints.push({
+        latlng: toMapCoords(sample.lat, sample.lng),
+        color: speedColor(sample.speed, previewSpeedMin, previewSpeedMax)
+      });
+    }
+    previewCursor = index;
+    if (previewTrail) previewTrail.setPoints(previewTrailPoints);
+  }
+  const current = previewSamples[previewCursor];
+  if (current) {
+    const mapPoint = toMapCoords(current.lat, current.lng);
+    if (previewMarker) previewMarker.setLatLng([mapPoint.lat, mapPoint.lng]);
+    updatePreviewInfo(current);
+  }
+}
+
+function beginPreviewRun(data) {
+  previewSamples = (data && data.samples) || [];
+  if (!previewSamples.length) {
+    updateMessage("没有可预览的轨迹", true);
+    return;
+  }
+  previewData = data;
+  previewTotalTime = previewSamples[previewSamples.length - 1].timeSec || 0;
+  // 按本次跑步的实际速度范围取色：最慢=红，最快=绿
+  let minSpeed = Infinity;
+  let maxSpeed = -Infinity;
+  for (let i = 0; i < previewSamples.length; i++) {
+    const v = previewSamples[i].speed;
+    if (Number.isFinite(v) && v > 0) {
+      if (v < minSpeed) minSpeed = v;
+      if (v > maxSpeed) maxSpeed = v;
+    }
+  }
+  previewSpeedMin = Number.isFinite(minSpeed) ? minSpeed : 0;
+  previewSpeedMax = Number.isFinite(maxSpeed) ? maxSpeed : previewSpeedMin + 1;
+  previewElapsed = 0;
+  previewCursor = 0;
+  previewTicks = 0;
+  previewTrailPoints = [];
+  previewMode = true;
+
+  hideEditingLayers();
+  if (previewMarker) {
+    map.removeLayer(previewMarker);
+    previewMarker = null;
+  }
+  if (previewTrail) {
+    map.removeLayer(previewTrail);
+    previewTrail = null;
+  }
+  previewTrail = createTrailLayer();
+  previewTrail.addTo(map);
+
+  const first = previewSamples[0];
+  const firstPoint = toMapCoords(first.lat, first.lng);
+  previewTrailPoints.push({
+    latlng: firstPoint,
+    color: speedColor(first.speed, previewSpeedMin, previewSpeedMax)
+  });
+  previewTrail.setPoints(previewTrailPoints);
+  previewMarker = L.circleMarker([firstPoint.lat, firstPoint.lng], {
+    radius: 8,
+    color: "#ffffff",
+    weight: 3,
+    fillColor: "#111827",
+    fillOpacity: 1
+  }).addTo(map);
+  updatePreviewInfo(first);
+
+  setPreviewButtons();
+  syncSegmentUi();
+  syncPreviewRateLabel();
+
+  // 立刻把第一小段画出来，点开预览就能看到东西
+  if (previewSamples.length > 1) {
+    previewElapsed = Math.min(previewSamples[1].timeSec, previewTotalTime);
+    syncPreviewTo(previewElapsed);
+  }
+  updatePreviewMessage();
+
+  stopPreviewTimer();
+  // 固定步长推进（30fps），不受系统时钟影响，后台标签页也一致
+  const STEP_SECONDS = 0.033;
+  previewTimer = setInterval(() => {
+    previewElapsed += STEP_SECONDS * getPreviewRate();
+    if (previewElapsed >= previewTotalTime) previewElapsed = previewTotalTime;
+    syncPreviewTo(previewElapsed);
+    if (previewTicks % 12 === 0) updatePreviewMessage();
+    previewTicks += 1;
+    if (previewElapsed >= previewTotalTime) {
+      stopPreviewTimer();
+      setPreviewButtons();
+      const km = (data.totalDistanceMeters / 1000).toFixed(2);
+      const minutes = (data.totalDurationSec / 60).toFixed(1);
+      updateMessage(`预览完成：${km} 公里 / ${minutes} 分钟，点「退出预览」回到路线图`);
+    }
+  }, 33);
+}
+
+function updatePreviewMessage() {
+  if (!previewMode) return;
+  const total = previewTotalTime > 0 ? previewTotalTime : 0;
+  const percent = total > 0 ? Math.min(100, Math.round((previewElapsed / total) * 100)) : 0;
+  const current = previewSamples[previewCursor] || previewSamples[0];
+  const doneKm = current ? (current.distance || 0) / 1000 : 0;
+  const totalKm = previewSamples.length
+    ? (previewSamples[previewSamples.length - 1].distance || 0) / 1000
+    : 0;
+  updateMessage(
+    `预览中 ${percent}%（${doneKm.toFixed(2)} / ${totalKm.toFixed(2)} km）— 红=慢，橙=中，绿=快`
+  );
+}
+
+function exitPreviewMode() {
+  if (!previewMode) {
+    // 已经在编辑状态，按一下也只是提示，不做多余操作
+    updateMessage("当前不在预览中");
+    return;
+  }
+  stopPreviewTimer();
+  previewMode = false;
+  previewTicks = 0;
+  if (previewTrail) {
+    map.removeLayer(previewTrail);
+    previewTrail = null;
+  }
+  if (previewMarker) {
+    map.removeLayer(previewMarker);
+    previewMarker = null;
+  }
+  previewTrailPoints = [];
+  previewSamples = [];
+  previewData = null;
+  setPreviewButtons();
+  syncSegmentUi();
+  renderRoute();
+  const info = document.getElementById("liveInfo");
+  if (info) info.textContent = "";
+  updateMessage("已退出预览，回到路线编辑");
+}
+
 async function previewActivity() {
   if (segments.main.length < 2) {
     updateMessage("请至少在地图上选择两个点形成主路线", true);
@@ -1678,8 +2261,7 @@ async function previewActivity() {
 
   const firstTimeInput = timeInputs[0];
   if (!firstTimeInput.value) {
-    const now = new Date();
-    firstTimeInput.value = dateToLocalInputValue(now);
+    firstTimeInput.value = dateToLocalInputValue(new Date());
   }
   const start = new Date(firstTimeInput.value);
   if (Number.isNaN(start.getTime())) {
@@ -1689,8 +2271,7 @@ async function previewActivity() {
 
   const pm = parseFloat(paceMinInputs[0] && paceMinInputs[0].value);
   const ps = parseFloat(paceSecInputs[0] && paceSecInputs[0].value);
-  const paceSecondsPerKm =
-    (Number.isFinite(pm) ? pm : 0) * 60 + (Number.isFinite(ps) ? ps : 0);
+  const paceSecondsPerKm = (Number.isFinite(pm) ? pm : 0) * 60 + (Number.isFinite(ps) ? ps : 0);
   if (!paceSecondsPerKm || paceSecondsPerKm <= 0) {
     updateMessage("预览使用的配速无效", true);
     return;
@@ -1698,118 +2279,64 @@ async function previewActivity() {
 
   const hrRest = parseInt(document.getElementById("hrRest").value, 10) || 60;
   const hrMax = parseInt(document.getElementById("hrMax").value, 10) || 180;
-
   const lapCount = getLapCount();
 
   updateMessage("正在生成预览，请稍候...");
+  await new Promise((resolve) => setTimeout(resolve, 20));
 
+  let data;
   try {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    let data;
-    try {
-      data = await Backend.preview({
-        startTime: start.toISOString(),
-        points: convertPointsToWgs84(segments.main),
-        startPoints: segmentUsable("start") ? convertPointsToWgs84(segments.start) : null,
-        endPoints: segmentUsable("end") ? convertPointsToWgs84(segments.end) : null,
-        paceSecondsPerKm,
-        hrRest,
-        hrMax,
-        lapCount,
-        routeMode,
-        routeOffset: getRouteOffset(),
-        weightKg: getWeightKg()
-      });
-    } catch (e) {
-      updateMessage((e && e.message) || "预览失败", true);
-      return;
-    }
-
-    const km = (data.totalDistanceMeters / 1000).toFixed(2);
-    const min = (data.totalDurationSec / 60).toFixed(1);
-    const offsetUsed = getRouteOffset();
-    updateMessage(
-      `预览已生成，总距离约 ${km} 公里，总时间约 ${min} 分钟（路线偏移 ${offsetUsed.toFixed(1)} 米）`
-    );
-    previewData = data;
-    previewIndex = 0;
-    if (previewTimer) {
-      clearInterval(previewTimer);
-      previewTimer = null;
-    }
-    if (previewMarker) {
-      map.removeLayer(previewMarker);
-      previewMarker = null;
-    }
-    if (previewTrace) {
-      map.removeLayer(previewTrace);
-      previewTrace = null;
-    }
-    const samples = previewData.samples || [];
-    if (samples.length > 0) {
-      // 先把整条生成轨迹画出来，能直接看出路线偏移效果，再决定导出
-      previewTrace = L.polyline(
-        samples.map((s) => toMapCoords(s.lat, s.lng)),
-        { color: "#1976d2", weight: 2, opacity: 0.5, dashArray: "6 4" }
-      ).addTo(map);
-      const first = samples[0];
-      const pos = toMapCoords(first.lat, first.lng);
-      previewMarker = L.circleMarker([pos.lat, pos.lng], {
-        radius: 6,
-        color: "#1976d2"
-      }).addTo(map);
-      startPreviewPlayback();
-    }
+    data = await Backend.preview({
+      startTime: start.toISOString(),
+      points: convertPointsToWgs84(segments.main),
+      startPoints: segmentUsable("start") ? convertPointsToWgs84(segments.start) : null,
+      endPoints: segmentUsable("end") ? convertPointsToWgs84(segments.end) : null,
+      paceSecondsPerKm,
+      hrRest,
+      hrMax,
+      lapCount,
+      routeMode,
+      routeOffset: getRouteOffset(),
+      weightKg: getWeightKg()
+    });
   } catch (e) {
-    console.error(e);
-    updateMessage((e && (e.message || e.error)) || "预览失败", true);
+    updateMessage((e && e.message) || "预览失败", true);
+    return;
   }
+
+  beginPreviewRun(data);
 }
 
 const previewBtn = document.getElementById("previewBtn");
-if (previewBtn) {
-  previewBtn.addEventListener("click", previewActivity);
+if (previewBtn) previewBtn.addEventListener("click", previewActivity);
+
+const exitPreviewBtn = document.getElementById("exitPreviewBtn");
+if (exitPreviewBtn) exitPreviewBtn.addEventListener("click", () => exitPreviewMode());
+
+const previewRateInput = document.getElementById("previewRate");
+if (previewRateInput) {
+  previewRateInput.addEventListener("input", () => {
+    syncPreviewRateLabel();
+  });
+  syncPreviewRateLabel();
 }
 
-function updateLiveInfo(sample) {
-  const el = document.getElementById("liveInfo");
-  if (!el || !sample) return;
-  const t = Math.max(0, sample.timeSec || 0);
-  const min = Math.floor(t / 60);
-  const sec = Math.floor(t % 60);
-  const speed = sample.speed > 0 ? sample.speed : 0.01;
-  const secPerKm = 1000 / speed;
-  const paceMin = Math.floor(secPerKm / 60);
-  const paceSec = Math.round(secPerKm % 60);
-  const paceStr = `${paceMin}'${paceSec.toString().padStart(2, "0")}"/km`;
-  const hr = sample.heartRate || 0;
-  el.textContent = `时间 ${min}:${sec.toString().padStart(2, "0")}  配速 ${paceStr}  心率 ${hr} bpm`;
-}
-
-function startPreviewPlayback() {
-  const samples = previewData && previewData.samples;
-  if (!samples || !samples.length) return;
-
-  const totalSamples = samples.length;
-  const stepMs = 100;
-  previewIndex = 0;
-
-  if (previewTimer) {
-    clearInterval(previewTimer);
-  }
-
-  previewTimer = setInterval(() => {
-    if (previewIndex >= totalSamples) {
-      clearInterval(previewTimer);
-      previewTimer = null;
-      return;
+// 供自动化测试使用（不影响功能）
+if (typeof window !== "undefined") {
+  window.FitToolDebug = {
+    toMapCoords: toMapCoords,
+    projectPoint: function (lat, lng) { return map.latLngToContainerPoint([lat, lng]); },
+    speedColor: speedColor,
+    previewState: function () {
+      return {
+        mode: previewMode,
+        elapsed: previewElapsed,
+        total: previewTotalTime,
+        cursor: previewCursor,
+        points: previewTrailPoints.length,
+        samples: previewSamples.length,
+        timer: Boolean(previewTimer)
+      };
     }
-    const s = samples[previewIndex];
-    if (previewMarker && s.lat != null && s.lng != null) {
-      const pos = toMapCoords(s.lat, s.lng);
-      previewMarker.setLatLng([pos.lat, pos.lng]);
-    }
-    updateLiveInfo(s);
-    previewIndex += 1;
-  }, stepMs);
+  };
 }

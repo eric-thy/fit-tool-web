@@ -371,3 +371,157 @@ button.secondary:disabled:hover {
   background: #2563eb;
   border-color: #2563eb;
 }
+
+/* ===== 路线编辑工具 ===== */
+.seg-tools {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.seg-tools button {
+  padding: 5px 4px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+button.secondary.active {
+  background: #ff5722;
+  border-color: #ff5722;
+  color: #ffffff;
+}
+
+.route-vertex-selected span {
+  background: #ff5722;
+  border-color: #7c2d12;
+  transform: scale(1.3);
+}
+
+.route-vertex-cut span {
+  background: #facc15;
+  border-color: #a16207;
+  transform: scale(1.25);
+}
+
+.route-vertex-head span {
+  background: #16a34a;
+  border-color: #14532d;
+}
+
+.route-vertex-tail span {
+  background: #2563eb;
+  border-color: #1e3a8a;
+}
+
+/* ===== 预览 ===== */
+.leaflet-trail-layer {
+  pointer-events: none;
+}
+
+.speed-legend {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #6b7280;
+}
+
+.speed-legend i {
+  flex: 1;
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #ef4444 0%, #f59e0b 55%, #22c55e 100%);
+}
+
+#exitPreviewBtn {
+  margin-top: 4px;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+
+/* ===== 侧栏：上面滚动、底部按钮固定 ===== */
+.sidebar {
+  padding: 12px 14px;
+  gap: 0;
+  overflow: hidden;
+  height: 100vh;
+}
+
+.sidebar-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-right: 4px;
+}
+
+.sidebar-actions {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid #e5e7eb;
+  background: #ffffff;
+}
+
+.sidebar-actions .buttons {
+  margin: 0;
+}
+
+.sidebar-actions #distanceInfo {
+  font-weight: 600;
+  color: #111827;
+}
+
+/* 滚动条更明显，提示上面还有内容 */
+.sidebar-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 #f1f5f9;
+}
+
+.sidebar-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.sidebar-scroll::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+.sidebar-scroll::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+
+.sidebar-scroll {
+  gap: 8px;
+}
+
+/* 底部操作按钮：四列排布，节省高度 */
+.sidebar-actions .buttons button {
+  flex: 1 1 20%;
+  min-width: 0;
+  font-size: 12px;
+  padding: 6px 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar-actions .buttons {
+  gap: 6px;
+}
+
+.sidebar-actions #message,
+.sidebar-actions #liveInfo {
+  min-height: 18px;
+  line-height: 1.35;
+}
+
+/* 底部按钮行改为横向排布（否则会继承 form-group 的 column 方向） */
+.sidebar-actions .buttons {
+  flex-direction: row;
+}

@@ -29979,8 +29979,40 @@ function buildRouteOffsetCurves(pointCount, offsetMeters, laps) {
   }
   return curves;
 }
-// 轨迹 = 起跑段（不闭合）+ 主路线 × 圈数 + 收尾段（不闭合）。
-// startPoints / endPoints 用来模拟"从场外斜插进跑道""跑完再从跑道离开到门口"。
+// 轨迹 = 首圈 + 主路线 × 中间圈数 + 尾圈（圈数 = 总圈数）。
+// 首圈 / 尾圈是可选的整圈替换：首圈替换第 1 圈，尾圈替换最后一圈。
+// 主路线会先旋转到最靠近接点（首圈终点 / 尾圈起点）的顶点，避免接缝处拉出一条直线。
+function distMeters(a, b) {
+  const R = 6371e3;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const x =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+}
+function rotateClosedLoop(closedPoints, index) {
+  const n = closedPoints.length - 1;
+  if (!(n > 1) || index <= 0 || index >= n) return closedPoints;
+  const open = closedPoints.slice(0, n);
+  const rotated = open.slice(index).concat(open.slice(0, index));
+  rotated.push(rotated[0]);
+  return rotated;
+}
+function nearestLoopIndex(closedPoints, target) {
+  const n = closedPoints.length - 1;
+  let best = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < n; i++) {
+    const d = distMeters(closedPoints[i], target);
+    if (d < bestDist) {
+      bestDist = d;
+      best = i;
+    }
+  }
+  return best;
+}
 function pushPointsWithOffset(out, points, offsetMeters) {
   const curves = buildRouteOffsetCurves(points.length, offsetMeters, 1);
   const curve = curves[0];
@@ -29997,17 +30029,33 @@ function pushPointsWithOffset(out, points, offsetMeters) {
 function buildAllPoints(points, laps, offsetMeters, loop, startPoints, endPoints) {
   const basePoints = loop ? buildClosedBasePoints(points) : points;
   const usedLaps = loop && laps > 0 ? laps : 1;
-  const startSegment =
+  const firstLap =
     loop && Array.isArray(startPoints) && startPoints.length >= 2 ? startPoints : null;
-  const endSegment =
-    loop && Array.isArray(endPoints) && endPoints.length >= 2 ? endPoints : null;
+  const lastLap = loop && Array.isArray(endPoints) && endPoints.length >= 2 ? endPoints : null;
+
+  // 主路线旋转到接点处起步：首圈终点优先，其次尾圈起点
+  let loopPoints = basePoints;
+  if (loop && basePoints.length >= 3) {
+    const junction = firstLap ? firstLap[firstLap.length - 1] : lastLap ? lastLap[0] : null;
+    if (junction) {
+      loopPoints = rotateClosedLoop(basePoints, nearestLoopIndex(basePoints, junction));
+    }
+  }
 
   const allPoints = [];
-  if (startSegment) pushPointsWithOffset(allPoints, startSegment, offsetMeters);
-  for (let lapIndex = 0; lapIndex < usedLaps; lapIndex++) {
-    pushPointsWithOffset(allPoints, basePoints, offsetMeters);
+  if (usedLaps <= 1) {
+    // 只有 1 圈：优先用首圈，其次尾圈，否则主路线
+    pushPointsWithOffset(allPoints, firstLap || lastLap || loopPoints, offsetMeters);
+    return allPoints;
   }
-  if (endSegment) pushPointsWithOffset(allPoints, endSegment, offsetMeters);
+
+  // 第 1 圈 + 中间圈 + 最后一圈，合计 usedLaps 圈
+  const middleLaps = Math.max(0, usedLaps - 2);
+  pushPointsWithOffset(allPoints, firstLap || loopPoints, offsetMeters);
+  for (let i = 0; i < middleLaps; i++) {
+    pushPointsWithOffset(allPoints, loopPoints, offsetMeters);
+  }
+  pushPointsWithOffset(allPoints, lastLap || loopPoints, offsetMeters);
   return allPoints;
 }
 function computeSamples(allPoints, distances, totalDist, paceSecondsPerKm, hrRestVal, hrMaxVal) {

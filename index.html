@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Fit Tool v1.8 — 校园跑数据生成</title>
+    <title>Fit Tool v2.0 — 校园跑数据生成</title>
     <meta name="description" content="在浏览器里绘制路线、拖动结点、调节路线偏移，本地生成 Garmin FIT 跑步数据。" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%23ff5722' stroke-width='4'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="./leaflet/leaflet.css" />
@@ -12,89 +12,106 @@
   <body>
     <div id="app">
       <div class="sidebar">
-        <h1>Fit Tool v1.8</h1>
-        <div class="form-group">
-          <label for="mapSource">地图源</label>
-          <select id="mapSource"></select>
-        </div>
-        <div class="form-group" id="mapKeyGroup" style="display: none">
-          <label for="mapKeyInput" id="mapKeyLabel">Key</label>
-          <input id="mapKeyInput" type="text" placeholder="输入 API Key" autocomplete="off" />
-        </div>
-        <div class="form-group">
-          <label class="checkbox-label">
-            <input id="coordConvert" type="checkbox" />
-            <span>坐标纠偏（GCJ-02 → WGS-84）</span>
-          </label>
-        </div>
-        <div class="form-group">
-          <label for="hrRest">静息心率</label>
-          <input id="hrRest" type="number" min="30" max="120" value="60" />
-        </div>
-        <div class="form-group">
-          <label for="hrMax">最大心率</label>
-          <input id="hrMax" type="number" min="100" max="220" value="180" />
-        </div>
-        <div class="form-group">
-          <label for="weightInput">体重（kg）</label>
-          <input id="weightInput" type="number" min="30" max="150" step="1" value="65" />
-        </div>
-        <div class="form-group">
-          <label for="routeMode">路线模式</label>
-          <select id="routeMode">
-            <option value="loop">环形（自动闭合，支持圈数）</option>
-            <option value="linear">线性（单程，不闭合）</option>
-          </select>
-        </div>
-        <div class="form-group" id="lapCountGroup">
-          <label for="lapCount">圈数（重复次数）</label>
-          <input id="lapCount" type="number" min="1" value="1" />
-        </div>
-        <div class="form-group">
-          <label>分段路线</label>
-          <div class="seg-tabs" id="segmentTabs">
-            <button type="button" class="seg-tab active" data-segment="main">主路线</button>
-            <button type="button" class="seg-tab" data-segment="start">起跑段</button>
-            <button type="button" class="seg-tab" data-segment="end">收尾段</button>
+        <div class="sidebar-scroll">
+          <h1>Fit Tool v2.0</h1>
+          <div class="form-group">
+            <label for="mapSource">地图源</label>
+            <select id="mapSource"></select>
           </div>
-          <label class="checkbox-label">
-            <input id="useStartSegment" type="checkbox" />
-            <span>启用起跑段</span>
-          </label>
-          <label class="checkbox-label">
-            <input id="useEndSegment" type="checkbox" />
-            <span>启用收尾段</span>
-          </label>
-          <div class="tip-inline" id="segmentHint">起跑段从起点斜插到跑道，收尾段从跑道跑到终点；中间跑「圈数」整圈。</div>
+          <div class="form-group" id="mapKeyGroup" style="display: none">
+            <label for="mapKeyInput" id="mapKeyLabel">Key</label>
+            <input id="mapKeyInput" type="text" placeholder="输入 API Key" autocomplete="off" />
+          </div>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input id="coordConvert" type="checkbox" />
+              <span>坐标纠偏（GCJ-02 → WGS-84）</span>
+            </label>
+          </div>
+          <div class="form-group">
+            <label for="hrRest">静息心率</label>
+            <input id="hrRest" type="number" min="30" max="120" value="60" />
+          </div>
+          <div class="form-group">
+            <label for="hrMax">最大心率</label>
+            <input id="hrMax" type="number" min="100" max="220" value="180" />
+          </div>
+          <div class="form-group">
+            <label for="weightInput">体重（kg）</label>
+            <input id="weightInput" type="number" min="30" max="150" step="1" value="65" />
+          </div>
+          <div class="form-group">
+            <label for="routeMode">路线模式</label>
+            <select id="routeMode">
+              <option value="loop">环形（自动闭合，支持圈数）</option>
+              <option value="linear">线性（单程，不闭合）</option>
+            </select>
+          </div>
+          <div class="form-group" id="lapCountGroup">
+            <label for="lapCount">圈数（总圈数）</label>
+            <input id="lapCount" type="number" min="1" value="1" />
+          </div>
+          <div class="form-group">
+            <label>分段路线</label>
+            <div class="seg-tabs" id="segmentTabs">
+              <button type="button" class="seg-tab active" data-segment="main">主路线</button>
+              <button type="button" class="seg-tab" data-segment="start">首圈</button>
+              <button type="button" class="seg-tab" data-segment="end">尾圈</button>
+            </div>
+            <label class="checkbox-label">
+              <input id="useStartSegment" type="checkbox" />
+              <span>启用首圈</span>
+            </label>
+            <label class="checkbox-label">
+              <input id="useEndSegment" type="checkbox" />
+              <span>启用尾圈</span>
+            </label>
+            <div class="seg-tools">
+              <button id="copyMainBtn" class="secondary" type="button" title="把主路线的形状复制过来，再剪切/拖动修改">从主路线复制</button>
+              <button id="cutBtn" class="secondary" type="button" title="依次点两个结点，删除它们之间较短的一段">剪切两点间</button>
+              <button id="deleteVertexBtn" class="secondary" type="button" title="先点选一个结点，或按 Delete 键">删除结点</button>
+              <button id="toggleEndBtn" class="secondary" type="button">起点换到另一端</button>
+            </div>
+            <div class="tip-inline" id="segmentHint">主路线是整圈；首圈 / 尾圈是从起点进场、出场到终点的连接段。</div>
+          </div>
+          <div class="form-group">
+            <label for="routeOffset">路线偏移量 <span id="routeOffsetValue" class="offset-value">3.0 米</span></label>
+            <input id="routeOffset" type="range" min="0" max="12" step="0.5" value="3" />
+            <div class="tip-inline">轨迹相对绘制路线的随机摆动幅度，0 = 完全贴合。建议 1~3 米。</div>
+          </div>
+          <div class="form-group">
+            <label for="previewRate">预览时长 <span id="previewRateValue" class="offset-value">15 秒</span></label>
+            <input id="previewRate" type="range" min="3" max="60" step="1" value="15" />
+            <div class="speed-legend"><span>慢</span><i></i><span>快</span></div>
+            <div class="tip-inline">整段轨迹用多少秒播完（越短越快）。只画跑过的路段，颜色按速度：红=慢，橙=中，绿=快。</div>
+            <button id="exitPreviewBtn" class="secondary" type="button" disabled>退出预览</button>
+          </div>
+          <div class="form-group">
+            <label for="exportCount">导出份数</label>
+            <input id="exportCount" type="number" min="1" max="10" value="1" />
+          </div>
+          <div id="exportTimes" class="export-times"></div>
+          <p class="tip">点击地图添加结点 · 拖动圆点移动结点 · 拖动路线整体平移 · 双击线段插入结点</p>
+          <p class="tip">快捷键：Ctrl+Z 撤回，Ctrl+Y 重做，Delete 删除选中结点，Esc 退出预览。</p>
         </div>
-        <div class="form-group">
-          <label for="routeOffset">路线偏移量 <span id="routeOffsetValue" class="offset-value">3.0 米</span></label>
-          <input id="routeOffset" type="range" min="0" max="12" step="0.5" value="3" />
-          <div class="tip-inline">轨迹相对绘制路线的随机摆动幅度，0 = 完全贴合。建议 1~3 米。</div>
+        <div class="sidebar-actions">
+          <div id="distanceInfo" class="distance-info"></div>
+          <div id="message" class="message"></div>
+          <div id="liveInfo" class="live-info"></div>
+          <div class="form-group buttons">
+            <button id="getLocationBtn" type="button" title="尝试获取当前位置">定位</button>
+            <button id="clearRoute" type="button" title="清除当前编辑的分段，可 Ctrl+Z 恢复">清除轨迹</button>
+            <button id="previewBtn" type="button" title="预览（Esc 退出）">预览</button>
+            <button id="generateFit" type="button" title="生成 FIT 文件">生成 FIT</button>
+          </div>
+          <div class="form-group buttons toolbar-buttons">
+            <button id="undoBtn" class="secondary" type="button" title="撤回（Ctrl+Z）" disabled>撤回</button>
+            <button id="redoBtn" class="secondary" type="button" title="重做（Ctrl+Y / Ctrl+Shift+Z）" disabled>重做</button>
+            <button id="exportRouteBtn" class="secondary" type="button" title="把当前路线保存为 GeoJSON 文件">导出路线</button>
+            <button id="importRouteBtn" class="secondary" type="button" title="从 GeoJSON / JSON 文件导入路线">导入路线</button>
+          </div>
+          <input id="importFile" type="file" accept=".json,.geojson,application/json,application/geo+json" hidden />
         </div>
-        <div class="form-group">
-          <label for="exportCount">导出份数</label>
-          <input id="exportCount" type="number" min="1" max="10" value="1" />
-        </div>
-        <div id="exportTimes" class="export-times"></div>
-        <div id="distanceInfo" class="distance-info"></div>
-        <div class="form-group buttons">
-          <button id="getLocationBtn" type="button">尝试获取当前位置</button>
-          <button id="clearRoute" type="button">清除轨迹</button>
-          <button id="previewBtn" type="button">预览</button>
-          <button id="generateFit" type="button">生成 FIT 文件</button>
-        </div>
-        <div class="form-group buttons toolbar-buttons">
-          <button id="undoBtn" class="secondary" type="button" title="撤回（Ctrl+Z）" disabled>撤回</button>
-          <button id="redoBtn" class="secondary" type="button" title="重做（Ctrl+Y / Ctrl+Shift+Z）" disabled>重做</button>
-          <button id="exportRouteBtn" class="secondary" type="button" title="把当前路线保存为 GeoJSON 文件">导出路线</button>
-          <button id="importRouteBtn" class="secondary" type="button" title="从 GeoJSON / JSON 文件导入路线">导入路线</button>
-        </div>
-        <input id="importFile" type="file" accept=".json,.geojson,application/json,application/geo+json" hidden />
-        <div id="message" class="message"></div>
-        <div id="liveInfo" class="live-info"></div>
-        <p class="tip">点击地图添加结点 · 拖动圆点移动结点 · 拖动路线整体平移 · 起跑段/收尾段单独绘制</p>
-        <p class="tip">快捷键：Ctrl+Z 撤回，Ctrl+Y / Ctrl+Shift+Z 重做。所有计算都在浏览器本地完成。</p>
       </div>
       <div id="map"></div>
     </div>
