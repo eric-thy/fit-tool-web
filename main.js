@@ -183,6 +183,17 @@ let previewIndex = 0;
 let previewMarker = null;
 let previewTrace = null;
 
+// 路线编辑状态：撤回栈 / 结点标记 / 拖动状态
+const HISTORY_LIMIT = 80;
+const undoStack = [];
+const redoStack = [];
+let vertexMarkers = [];
+let dragSnapshot = null;
+let isDraggingRoute = false;
+let isDraggingVertex = false;
+// 平移结束后浏览器还会补发一次 click，用它把这一个 click 吞掉，避免多加点
+let suppressMapClickUntil = 0;
+
 const mapSourceSelect = document.getElementById("mapSource");
 const mapKeyGroup = document.getElementById("mapKeyGroup");
 const mapKeyLabel = document.getElementById("mapKeyLabel");
@@ -213,12 +224,7 @@ function buildLayerUrl(source, template, key) {
   return template.replace("{key}", key ? "&key=" + encoded : "");
 }
 
-function clearRoute() {
-  routePoints = [];
-  if (polyline) {
-    map.removeLayer(polyline);
-    polyline = null;
-  }
+function clearPreviewOverlay() {
   if (previewMarker) {
     map.removeLayer(previewMarker);
     previewMarker = null;
@@ -231,7 +237,24 @@ function clearRoute() {
     clearInterval(previewTimer);
     previewTimer = null;
   }
+  previewData = null;
+  previewIndex = 0;
+}
+
+function clearRoute(options) {
+  const opts = options || {};
+  if (opts.recordHistory !== false && routePoints.length > 0) {
+    pushHistory();
+  }
+  routePoints = [];
+  removeAllVertices();
+  if (polyline) {
+    map.removeLayer(polyline);
+    polyline = null;
+  }
+  clearPreviewOverlay();
   updateDistanceInfo();
+  updateHistoryButtons();
 }
 
 function applySource(id) {
@@ -589,22 +612,530 @@ function updateDistanceInfo() {
   }
 }
 
-map.on("click", (e) => {
-  routePoints.push({ lat: e.latlng.lat, lng: e.latlng.lng });
-  const display = displayRoutePoints();
-  if (polyline) {
-    polyline.setLatLngs(display);
-  } else {
-    polyline = L.polyline(display, { color: "#ff5722" }).addTo(map);
+// ==================== 路线编辑：撤回 / 结点拖动 / 整体平移 / 导入导出 ====================
+function clonePoints(points) {
+  return (points || []).map((p) => ({ lat: p.lat, lng: p.lng }));
+}
+
+function clampLat(value) {
+  return Math.max(-85, Math.min(85, value));
+}
+
+function clampLng(value) {
+  return Math.max(-180, Math.min(180, value));
+}
+
+function clampPoint(point) {
+  return { lat: clampLat(Number(point.lat)), lng: clampLng(Number(point.lng)) };
+}
+
+function samePoints(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (Math.abs(a[i].lat - b[i].lat) > 1e-9) return false;
+    if (Math.abs(a[i].lng - b[i].lng) > 1e-9) return false;
   }
-  updateMessage(`已添加点数：${routePoints.length}`);
+  return true;
+}
+
+function pushHistory() {
+  undoStack.push(clonePoints(routePoints));
+  if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+  redoStack.length = 0;
+  updateHistoryButtons();
+}
+
+function updateHistoryButtons() {
+  const undoBtn = document.getElementById("undoBtn");
+  const redoBtn = document.getElementById("redoBtn");
+  if (undoBtn) undoBtn.disabled = undoStack.length === 0;
+  if (redoBtn) redoBtn.disabled = redoStack.length === 0;
+}
+
+function undo() {
+  if (isDraggingRoute || isDraggingVertex) return false;
+  if (!undoStack.length) {
+    updateMessage("没有可撤回的操作");
+    return false;
+  }
+  redoStack.push(clonePoints(routePoints));
+  routePoints = clonePoints(undoStack.pop());
+  clearPreviewOverlay();
+  renderRoute();
+  updateMessage("已撤回（Ctrl+Y 重做）");
+  return true;
+}
+
+function redo() {
+  if (isDraggingRoute || isDraggingVertex) return false;
+  if (!redoStack.length) {
+    updateMessage("没有可重做的操作");
+    return false;
+  }
+  undoStack.push(clonePoints(routePoints));
+  if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+  routePoints = clonePoints(redoStack.pop());
+  clearPreviewOverlay();
+  renderRoute();
+  updateMessage("已重做");
+  return true;
+}
+
+function routePolylineOptions() {
+  return {
+    color: "#ff5722",
+    weight: 4,
+    opacity: 0.9,
+    interactive: true,
+    // 关掉事件冒泡：点线不再新增结点，拖动线用来整体平移
+    bubblingMouseEvents: false,
+    className: "route-line"
+  };
+}
+
+function ensurePolyline() {
+  const latlngs = displayRoutePoints();
+  if (!latlngs || latlngs.length < 2) {
+    if (polyline) {
+      map.removeLayer(polyline);
+      polyline = null;
+    }
+    return;
+  }
+  if (polyline) {
+    polyline.setLatLngs(latlngs);
+  } else {
+    polyline = L.polyline(latlngs, routePolylineOptions()).addTo(map);
+    polyline.on("mousedown", onRouteLineMouseDown);
+  }
+}
+
+function vertexIcon() {
+  return L.divIcon({
+    className: "route-vertex",
+    html: "<span></span>",
+    iconSize: [16, 16],
+    iconAnchor: [8, 8]
+  });
+}
+
+function createVertexMarker(index) {
+  const point = routePoints[index];
+  const marker = L.marker([point.lat, point.lng], {
+    draggable: true,
+    keyboard: false,
+    autoPan: true,
+    zIndexOffset: 1000,
+    icon: vertexIcon(),
+    title: `结点 ${index + 1}（拖动可移动）`
+  });
+
+  marker.on("dragstart", () => {
+    clearPreviewOverlay();
+    isDraggingVertex = true;
+    dragSnapshot = { index, before: clonePoints(routePoints) };
+    undoStack.push(clonePoints(routePoints));
+    if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+    redoStack.length = 0;
+    updateHistoryButtons();
+  });
+
+  marker.on("drag", (e) => {
+    const latlng = e.target.getLatLng();
+    routePoints[index] = clampPoint({ lat: latlng.lat, lng: latlng.lng });
+    ensurePolyline();
+    updateDistanceInfo();
+  });
+
+  marker.on("dragend", () => {
+    isDraggingVertex = false;
+    const snapshot = dragSnapshot;
+    dragSnapshot = null;
+    if (snapshot && samePoints(snapshot.before, routePoints)) {
+      // 拖动后又回到原位：不留历史记录
+      undoStack.pop();
+      updateHistoryButtons();
+    } else {
+      updateMessage(`已移动结点 ${index + 1}（Ctrl+Z 撤回）`);
+    }
+    ensurePolyline();
+    updateDistanceInfo();
+  });
+
+  return marker;
+}
+
+function renderVertices() {
+  while (vertexMarkers.length > routePoints.length) {
+    const extra = vertexMarkers.pop();
+    if (extra) map.removeLayer(extra);
+  }
+  for (let i = 0; i < routePoints.length; i++) {
+    if (!vertexMarkers[i]) {
+      vertexMarkers[i] = createVertexMarker(i).addTo(map);
+    } else {
+      vertexMarkers[i].setLatLng([routePoints[i].lat, routePoints[i].lng]);
+    }
+  }
+}
+
+function removeAllVertices() {
+  vertexMarkers.forEach((marker) => {
+    if (marker) map.removeLayer(marker);
+  });
+  vertexMarkers = [];
+}
+
+function renderRoute() {
+  ensurePolyline();
+  renderVertices();
   updateDistanceInfo();
+  updateHistoryButtons();
+}
+
+// 拖动整条路线：按住线拖动即可平移
+function onRouteLineMouseDown(e) {
+  if (isDraggingRoute || routePoints.length < 2) return;
+  if (e.originalEvent && typeof e.originalEvent.button === "number" && e.originalEvent.button !== 0) {
+    return;
+  }
+  const startLatLng = e.latlng;
+  if (!startLatLng) return;
+
+  clearPreviewOverlay();
+  const origin = clonePoints(routePoints);
+  isDraggingRoute = true;
+  undoStack.push(clonePoints(routePoints));
+  if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+  redoStack.length = 0;
+  updateHistoryButtons();
+
+  const mapWasDraggable = map.dragging ? map.dragging.enabled() : false;
+  if (mapWasDraggable) map.dragging.disable();
+  const container = map.getContainer ? map.getContainer() : null;
+  if (container) container.style.cursor = "grabbing";
+
+  let moved = false;
+
+  const onDocMove = (ev) => {
+    if (!isDraggingRoute) return;
+    const latlng = map.mouseEventToLatLng(ev);
+    const dLat = latlng.lat - startLatLng.lat;
+    const dLng = latlng.lng - startLatLng.lng;
+    if (!moved && (Math.abs(dLat) > 0 || Math.abs(dLng) > 0)) moved = true;
+    routePoints = origin.map((p) => clampPoint({ lat: p.lat + dLat, lng: p.lng + dLng }));
+    ensurePolyline();
+    renderVertices();
+    updateDistanceInfo();
+  };
+
+  const finish = () => {
+    if (!isDraggingRoute) return;
+    isDraggingRoute = false;
+    document.removeEventListener("mousemove", onDocMove);
+    document.removeEventListener("mouseup", finish);
+    document.removeEventListener("mouseleave", finish);
+    if (typeof window !== "undefined" && window.removeEventListener) {
+      window.removeEventListener("blur", finish);
+    }
+    if (mapWasDraggable) map.dragging.enable();
+    if (container) container.style.cursor = "";
+    if (!moved) {
+      undoStack.pop();
+      updateHistoryButtons();
+    } else {
+      // 拖线时地图拖动被禁用，Leaflet 不会自动抑制随后的 click，这里手动吞掉
+      suppressMapClickUntil = Date.now() + 500;
+      updateMessage("已平移整条路线（Ctrl+Z 撤回）");
+    }
+    ensurePolyline();
+    updateDistanceInfo();
+  };
+
+  document.addEventListener("mousemove", onDocMove);
+  document.addEventListener("mouseup", finish);
+  // 鼠标移出窗口/浏览器失焦时也要结束拖动，避免地图卡在禁用状态
+  document.addEventListener("mouseleave", finish);
+  if (typeof window !== "undefined" && window.addEventListener) {
+    window.addEventListener("blur", finish);
+  }
+  if (e.originalEvent && e.originalEvent.preventDefault) e.originalEvent.preventDefault();
+}
+
+// ---------- 导出 / 导入 ----------
+function downloadBlob(blob, filename) {
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(url);
+}
+
+function round6(value) {
+  return Math.round(value * 1e6) / 1e6;
+}
+
+function buildRouteExportData() {
+  return {
+    type: "Feature",
+    properties: {
+      name: "Fit Tool route",
+      tool: "Fit Tool v1.6",
+      routeMode,
+      lapCount: getLapCount(),
+      routeOffset: getRouteOffset(),
+      pointCount: routePoints.length,
+      exportedAt: new Date().toISOString()
+    },
+    geometry: {
+      type: "LineString",
+      coordinates: routePoints.map((p) => [round6(p.lng), round6(p.lat)])
+    }
+  };
+}
+
+function exportRoute() {
+  if (routePoints.length < 2) {
+    updateMessage("至少需要两个点才能导出路线", true);
+    return;
+  }
+  try {
+    const data = buildRouteExportData();
+    const blob = new Blob([JSON.stringify(data, null, 2)], {
+      type: "application/geo+json"
+    });
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    const stamp =
+      now.getFullYear() +
+      pad(now.getMonth() + 1) +
+      pad(now.getDate()) +
+      "-" +
+      pad(now.getHours()) +
+      pad(now.getMinutes()) +
+      pad(now.getSeconds());
+    downloadBlob(blob, `route-${stamp}.geojson`);
+    updateMessage(`已导出路线：${routePoints.length} 个结点`);
+  } catch (e) {
+    updateMessage("导出失败：" + ((e && e.message) || "未知错误"), true);
+  }
+}
+
+function coordinatesToPoints(coordinates) {
+  if (!Array.isArray(coordinates)) return null;
+  const points = [];
+  for (const item of coordinates) {
+    if (!Array.isArray(item) || item.length < 2) return null;
+    const lng = Number(item[0]);
+    const lat = Number(item[1]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+    points.push({ lat, lng });
+  }
+  return points;
+}
+
+// 兼容 GeoJSON（Feature / FeatureCollection / LineString / MultiLineString / Polygon）与旧版 JSON
+function extractRoutePoints(data) {
+  if (!data) return null;
+  if (Array.isArray(data)) {
+    if (!data.length) return null;
+    if (typeof data[0] === "object" && data[0] && typeof data[0].lat === "number") {
+      return data.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }));
+    }
+    if (Array.isArray(data[0])) return coordinatesToPoints(data);
+    return null;
+  }
+  if (typeof data !== "object") return null;
+  if (data.type === "Feature" && data.geometry) return extractRoutePoints(data.geometry);
+  if (data.type === "FeatureCollection" && Array.isArray(data.features)) {
+    for (const feature of data.features) {
+      const points = extractRoutePoints(feature);
+      if (points && points.length >= 2) return points;
+    }
+    return null;
+  }
+  if (data.type === "LineString") return coordinatesToPoints(data.coordinates);
+  if (data.type === "MultiLineString" && Array.isArray(data.coordinates)) {
+    const merged = [];
+    for (const line of data.coordinates) {
+      const points = coordinatesToPoints(line);
+      if (points) merged.push(...points);
+    }
+    return merged.length ? merged : null;
+  }
+  if (data.type === "Polygon" && Array.isArray(data.coordinates)) {
+    return coordinatesToPoints(data.coordinates[0]);
+  }
+  if (Array.isArray(data.points)) return extractRoutePoints(data.points);
+  if (data.geometry) return extractRoutePoints(data.geometry);
+  return null;
+}
+
+function validateImportedPoints(points) {
+  if (!points || points.length < 2) {
+    throw new Error("文件里没有足够的轨迹点（至少需要 2 个）");
+  }
+  if (points.length > 5000) {
+    throw new Error("轨迹点太多（超过 5000 个），请精简后再导入");
+  }
+  const cleaned = [];
+  for (const point of points) {
+    const lat = Number(point && point.lat);
+    const lng = Number(point && point.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      throw new Error("文件里有无效的坐标");
+    }
+    if (Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+      throw new Error("文件里的坐标超出合法范围");
+    }
+    cleaned.push({ lat, lng });
+  }
+  return cleaned;
+}
+
+function fitViewToRoute() {
+  if (!routePoints.length) return;
+  try {
+    if (routePoints.length === 1) {
+      map.setView([routePoints[0].lat, routePoints[0].lng], Math.max(map.getZoom(), 15));
+      return;
+    }
+    const bounds = L.latLngBounds(routePoints.map((p) => [p.lat, p.lng]));
+    map.fitBounds(bounds, { padding: [40, 40], maxZoom: 18 });
+  } catch (e) {
+    // 视图调整失败不影响数据
+  }
+}
+
+function importRouteFromText(text) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    throw new Error("不是有效的 JSON / GeoJSON 文件");
+  }
+  const raw = extractRoutePoints(data);
+  const points = validateImportedPoints(raw);
+  const props = (data && data.properties) || (data && data.features && data.features[0] && data.features[0].properties) || {};
+
+  pushHistory();
+  clearPreviewOverlay();
+  routePoints = points.map(clampPoint);
+
+  if (props && (props.routeMode === "loop" || props.routeMode === "linear")) {
+    const modeSelect = document.getElementById("routeMode");
+    if (modeSelect) {
+      modeSelect.value = props.routeMode;
+      applyRouteMode();
+    }
+  }
+  if (props && Number.isFinite(Number(props.lapCount)) && Number(props.lapCount) > 0) {
+    const lapInput = document.getElementById("lapCount");
+    if (lapInput) lapInput.value = String(Math.max(1, Math.floor(Number(props.lapCount))));
+  }
+  if (props && Number.isFinite(Number(props.routeOffset))) {
+    const offsetInput = document.getElementById("routeOffset");
+    if (offsetInput) {
+      offsetInput.value = String(clampRouteOffset(props.routeOffset));
+      syncRouteOffsetLabel();
+    }
+  }
+
+  renderRoute();
+  fitViewToRoute();
+  updateMessage(`已导入路线：${routePoints.length} 个结点`);
+}
+
+function readFileAsText(file) {
+  if (file && typeof file.text === "function") {
+    return file.text();
+  }
+  return new Promise((resolve, reject) => {
+    if (typeof FileReader === "undefined") {
+      reject(new Error("当前浏览器不支持读取文件"));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("读取文件失败"));
+    reader.readAsText(file);
+  });
+}
+
+map.on("click", (e) => {
+  if (Date.now() < suppressMapClickUntil) {
+    suppressMapClickUntil = 0;
+    return;
+  }
+  pushHistory();
+  clearPreviewOverlay();
+  routePoints.push(clampPoint({ lat: e.latlng.lat, lng: e.latlng.lng }));
+  renderRoute();
+  updateMessage(`已添加点数：${routePoints.length}（Ctrl+Z 撤回）`);
 });
 
 const clearBtn = document.getElementById("clearRoute");
 clearBtn.addEventListener("click", () => {
-  clearRoute();
-  updateMessage("轨迹已清除");
+  if (!routePoints.length) {
+    updateMessage("轨迹已经是空的");
+    return;
+  }
+  clearRoute({ recordHistory: true });
+  updateMessage("轨迹已清除（Ctrl+Z 可恢复）");
+});
+
+const undoBtn = document.getElementById("undoBtn");
+if (undoBtn) {
+  undoBtn.addEventListener("click", () => undo());
+}
+const redoBtn = document.getElementById("redoBtn");
+if (redoBtn) {
+  redoBtn.addEventListener("click", () => redo());
+}
+const exportRouteBtn = document.getElementById("exportRouteBtn");
+if (exportRouteBtn) {
+  exportRouteBtn.addEventListener("click", () => exportRoute());
+}
+
+const importFileInput = document.getElementById("importFile");
+const importRouteBtn = document.getElementById("importRouteBtn");
+if (importRouteBtn && importFileInput) {
+  importRouteBtn.addEventListener("click", () => importFileInput.click());
+  importFileInput.addEventListener("change", async () => {
+    const file = importFileInput.files && importFileInput.files[0];
+    importFileInput.value = "";
+    if (!file) return;
+    try {
+      const text = await readFileAsText(file);
+      importRouteFromText(text);
+    } catch (e) {
+      updateMessage((e && e.message) || "导入失败", true);
+    }
+  });
+}
+
+// 快捷键：Ctrl/Cmd+Z 撤回，Ctrl/Cmd+Y 或 Ctrl/Cmd+Shift+Z 重做
+document.addEventListener("keydown", (e) => {
+  const target = e.target;
+  const tag = target && target.tagName ? String(target.tagName).toLowerCase() : "";
+  const isEditable =
+    tag === "input" ||
+    tag === "textarea" ||
+    tag === "select" ||
+    (target && target.isContentEditable);
+  if (isEditable) return;
+  if (!(e.ctrlKey || e.metaKey)) return;
+  const key = String(e.key || "").toLowerCase();
+  if (key === "z" && !e.shiftKey) {
+    e.preventDefault();
+    undo();
+  } else if (key === "y" || (key === "z" && e.shiftKey)) {
+    e.preventDefault();
+    redo();
+  }
 });
 
 // ==================== 导出时间列表 ====================
@@ -660,6 +1191,71 @@ function rebuildExportTimes() {
     container.appendChild(row);
   }
 }
+
+// ==================== 生成后端：桌面版走本地服务，网页版走浏览器内核 ====================
+function normalizeGenerationError(e) {
+  if (e instanceof Error) return e;
+  const message = (e && (e.message || e.error)) || "操作失败";
+  return new Error(message);
+}
+
+const Backend = (function () {
+  const core =
+    typeof window !== "undefined" &&
+    window.FitCore &&
+    typeof window.FitCore.generateFitFile === "function"
+      ? window.FitCore
+      : null;
+
+  if (core) {
+    return {
+      mode: "local",
+      async preview(body) {
+        try {
+          return core.previewActivity(body);
+        } catch (e) {
+          throw normalizeGenerationError(e);
+        }
+      },
+      async generate(body) {
+        try {
+          const result = core.generateFitFile(body);
+          return { bytes: result.bytes, filename: result.filename };
+        } catch (e) {
+          throw normalizeGenerationError(e);
+        }
+      }
+    };
+  }
+
+  return {
+    mode: "server",
+    async preview(body) {
+      const res = await fetch("/api/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || "预览失败");
+      }
+      return res.json();
+    },
+    async generate(body) {
+      const res = await fetch("/api/generate-fit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || "生成失败");
+      }
+      return { bytes: new Uint8Array(await res.arrayBuffer()) };
+    }
+  };
+})();
 
 // ==================== 生成 FIT ====================
 async function generateFit() {
@@ -724,12 +1320,12 @@ async function generateFit() {
         return;
       }
 
-      // 纯前端生成：先把"正在生成"提示刷出来，再做同步计算
+      // 先让"正在生成"的提示刷新出来，再做计算
       await new Promise((resolve) => setTimeout(resolve, 30));
 
       let result;
       try {
-        result = window.FitCore.generateFitFile({
+        result = await Backend.generate({
           startTime: fileStart.toISOString(),
           points: wgsPoints,
           paceSecondsPerKm,
@@ -742,19 +1338,12 @@ async function generateFit() {
           weightKg: getWeightKg()
         });
       } catch (e) {
-        updateMessage((e && (e.message || e.error)) || "\u751F\u6210\u5931\u8D25", true);
+        updateMessage((e && e.message) || "生成失败", true);
         return;
       }
 
       const blob = new Blob([result.bytes], { type: "application/vnd.ant.fit" });
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = exportCount > 1 ? `run_${i + 1}.fit` : "run.fit";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(url);
+      downloadBlob(blob, exportCount > 1 ? `run_${i + 1}.fit` : "run.fit");
     }
     updateMessage(`已生成 ${exportCount} 个 FIT 文件并开始下载`);
   } catch (e) {
@@ -765,11 +1354,6 @@ async function generateFit() {
 
 const genBtn = document.getElementById("generateFit");
 genBtn.addEventListener("click", generateFit);
-
-// 纯静态版本依赖 fit-core.js 在浏览器本地生成 FIT
-if (!window.FitCore) {
-  updateMessage("fit-core.js 未加载成功，生成功能不可用，请检查文件是否完整", true);
-}
 
 const lapInputInit = document.getElementById("lapCount");
 if (lapInputInit) {
@@ -849,19 +1433,24 @@ async function previewActivity() {
   updateMessage("正在生成预览，请稍候...");
 
   try {
-    // 纯前端计算，无需服务端
     await new Promise((resolve) => setTimeout(resolve, 20));
-    const data = window.FitCore.previewActivity({
-      startTime: start.toISOString(),
-      points: convertRoutePointsToWgs84(),
-      paceSecondsPerKm,
-      hrRest,
-      hrMax,
-      lapCount,
-      routeMode,
-      routeOffset: getRouteOffset(),
-      weightKg: getWeightKg()
-    });
+    let data;
+    try {
+      data = await Backend.preview({
+        startTime: start.toISOString(),
+        points: convertRoutePointsToWgs84(),
+        paceSecondsPerKm,
+        hrRest,
+        hrMax,
+        lapCount,
+        routeMode,
+        routeOffset: getRouteOffset(),
+        weightKg: getWeightKg()
+      });
+    } catch (e) {
+      updateMessage((e && e.message) || "预览失败", true);
+      return;
+    }
 
     const km = (data.totalDistanceMeters / 1000).toFixed(2);
     const min = (data.totalDurationSec / 60).toFixed(1);

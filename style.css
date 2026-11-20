@@ -13,6 +13,7 @@ body {
 }
 
 .sidebar {
+  overflow-y: auto;
   width: 340px;
   padding: 16px 18px;
   box-sizing: border-box;
@@ -73,7 +74,21 @@ select:focus {
 
 .buttons {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
+}
+
+.buttons button {
+  flex: 1 1 46%;
+  white-space: nowrap;
+  padding: 6px 6px;
+  font-size: 13px;
+}
+
+.export-time-row span {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  font-size: 11px;
 }
 
 button {
@@ -126,6 +141,7 @@ button:active {
   display: flex;
   align-items: center;
   gap: 4px;
+  min-width: 0;
 }
 
 .export-time-row span {
@@ -133,13 +149,17 @@ button:active {
 }
 
 .export-time-row input[type="datetime-local"] {
-  flex: 1.2;
+  flex: 1 1 0;
+  min-width: 0;
 }
 
 .export-pace-min,
 .export-pace-sec {
-  width: 40px;
+  flex: 0 0 34px;
+  width: 34px;
+  padding: 4px 2px;
   font-size: 12px;
+  text-align: center;
 }
 
 .live-info {
@@ -255,4 +275,57 @@ input[type="range"] {
   background: transparent;
   accent-color: #2563eb;
   cursor: pointer;
+}
+
+/* ===== 路线编辑（撤回 / 结点拖动 / 平移 / 导入导出） ===== */
+
+.toolbar-buttons button {
+  flex: 1 1 44%;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+
+button.secondary {
+  background: #eef2ff;
+  color: #1d4ed8;
+  border: 1px solid #c7d2fe;
+}
+
+button.secondary:hover {
+  background: #e0e7ff;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.secondary:disabled:hover {
+  background: #eef2ff;
+}
+
+.route-line {
+  cursor: grab;
+}
+
+.route-vertex {
+  background: transparent;
+  border: none;
+}
+
+.route-vertex span {
+  display: block;
+  width: 14px;
+  height: 14px;
+  margin: 1px;
+  box-sizing: border-box;
+  border-radius: 50%;
+  background: #ffffff;
+  border: 2px solid #ff5722;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  cursor: grab;
+}
+
+.route-vertex span:hover {
+  background: #ffe0d6;
 }

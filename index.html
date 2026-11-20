@@ -3,15 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Fit Tool v1.5 — 校园跑数据生成</title>
-    <meta name="description" content="在浏览器里绘制路线、调节路线偏移，本地生成 Garmin FIT 跑步数据。" />
+    <title>Fit Tool v1.6 — 校园跑数据生成</title>
+    <meta name="description" content="在浏览器里绘制路线、拖动结点、调节路线偏移，本地生成 Garmin FIT 跑步数据。" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%23ff5722' stroke-width='4'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="./leaflet/leaflet.css" />
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
     <div id="app">
       <div class="sidebar">
-        <h1>Fit Tool v1.5</h1>
+        <h1>Fit Tool v1.6</h1>
         <div class="form-group">
           <label for="mapSource">地图源</label>
           <select id="mapSource"></select>
@@ -66,9 +67,17 @@
           <button id="previewBtn" type="button">预览</button>
           <button id="generateFit" type="button">生成 FIT 文件</button>
         </div>
+        <div class="form-group buttons toolbar-buttons">
+          <button id="undoBtn" class="secondary" type="button" title="撤回（Ctrl+Z）" disabled>撤回</button>
+          <button id="redoBtn" class="secondary" type="button" title="重做（Ctrl+Y / Ctrl+Shift+Z）" disabled>重做</button>
+          <button id="exportRouteBtn" class="secondary" type="button" title="把当前路线保存为 GeoJSON 文件">导出路线</button>
+          <button id="importRouteBtn" class="secondary" type="button" title="从 GeoJSON / JSON 文件导入路线">导入路线</button>
+        </div>
+        <input id="importFile" type="file" accept=".json,.geojson,application/json,application/geo+json" hidden />
         <div id="message" class="message"></div>
         <div id="liveInfo" class="live-info"></div>
-        <p class="tip">在右侧地图上点击绘制轨迹点，系统会自动连成路线。所有计算都在你的浏览器本地完成，不会上传任何数据。</p>
+        <p class="tip">点击地图添加结点 · 拖动橙色圆点移动单个结点 · 按住路线拖动可整体平移</p>
+        <p class="tip">快捷键：Ctrl+Z 撤回，Ctrl+Y / Ctrl+Shift+Z 重做。所有计算都在浏览器本地完成。</p>
       </div>
       <div id="map"></div>
     </div>
