@@ -29979,37 +29979,35 @@ function buildRouteOffsetCurves(pointCount, offsetMeters, laps) {
   }
   return curves;
 }
-// laps：总圈数；firstPoints / lastPoints：可选的「首圈 / 尾圈」自定义形状。
-// 首圈替换第 1 圈，尾圈替换最后一圈，中间各圈仍用主路线。
-function buildLapPoints(points, loop) {
-  if (!Array.isArray(points) || points.length < 2) return null;
-  return loop ? buildClosedBasePoints(points) : points;
-}
-function buildAllPoints(points, laps, offsetMeters, loop, firstPoints, lastPoints) {
-  const basePoints = loop ? buildClosedBasePoints(points) : points;
-  const usedLaps = loop && laps > 0 ? laps : 1;
-  const firstLap = usedLaps > 1 ? buildLapPoints(firstPoints, loop) : null;
-  const lastLap = usedLaps > 1 ? buildLapPoints(lastPoints, loop) : null;
-  const allPoints = [];
-  for (let lapIndex = 0; lapIndex < usedLaps; lapIndex++) {
-    let lapPoints = basePoints;
-    if (lapIndex === 0 && firstLap) {
-      lapPoints = firstLap;
-    } else if (lapIndex === usedLaps - 1 && lastLap) {
-      lapPoints = lastLap;
-    }
-    const curves = buildRouteOffsetCurves(lapPoints.length, offsetMeters, 1);
-    const curve = curves[0];
-    for (let i = 0; i < lapPoints.length; i++) {
-      const p = lapPoints[i];
-      const c = curve && curve[i];
-      if (c && (c.lat !== 0 || c.lon !== 0)) {
-        allPoints.push(offsetPointMeters(p, c.lat, c.lon));
-      } else {
-        allPoints.push(p);
-      }
+// 轨迹 = 起跑段（不闭合）+ 主路线 × 圈数 + 收尾段（不闭合）。
+// startPoints / endPoints 用来模拟"从场外斜插进跑道""跑完再从跑道离开到门口"。
+function pushPointsWithOffset(out, points, offsetMeters) {
+  const curves = buildRouteOffsetCurves(points.length, offsetMeters, 1);
+  const curve = curves[0];
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    const c = curve && curve[i];
+    if (c && (c.lat !== 0 || c.lon !== 0)) {
+      out.push(offsetPointMeters(p, c.lat, c.lon));
+    } else {
+      out.push(p);
     }
   }
+}
+function buildAllPoints(points, laps, offsetMeters, loop, startPoints, endPoints) {
+  const basePoints = loop ? buildClosedBasePoints(points) : points;
+  const usedLaps = loop && laps > 0 ? laps : 1;
+  const startSegment =
+    loop && Array.isArray(startPoints) && startPoints.length >= 2 ? startPoints : null;
+  const endSegment =
+    loop && Array.isArray(endPoints) && endPoints.length >= 2 ? endPoints : null;
+
+  const allPoints = [];
+  if (startSegment) pushPointsWithOffset(allPoints, startSegment, offsetMeters);
+  for (let lapIndex = 0; lapIndex < usedLaps; lapIndex++) {
+    pushPointsWithOffset(allPoints, basePoints, offsetMeters);
+  }
+  if (endSegment) pushPointsWithOffset(allPoints, endSegment, offsetMeters);
   return allPoints;
 }
 function computeSamples(allPoints, distances, totalDist, paceSecondsPerKm, hrRestVal, hrMaxVal) {
@@ -30112,13 +30110,13 @@ function buildActivity(body) {
     ? Math.max(0, Math.min(ROUTE_OFFSET_LIMIT_METERS, Number(offsetRaw)))
     : 0;
   const cleanPoints = validatePoints(body && body.points);
-  // 可选的首圈 / 尾圈自定义形状（起点终点不在同一位置时用）
-  const firstLapRaw = body && body.firstLapPoints;
-  const lastLapRaw = body && body.lastLapPoints;
-  const firstLapPoints =
-    Array.isArray(firstLapRaw) && firstLapRaw.length > 0 ? validatePoints(firstLapRaw) : null;
-  const lastLapPoints =
-    Array.isArray(lastLapRaw) && lastLapRaw.length > 0 ? validatePoints(lastLapRaw) : null;
+  // 可选的起跑段 / 收尾段（不闭合的连接线）
+  const startRaw = body && body.startPoints;
+  const endRaw = body && body.endPoints;
+  const startSegmentPoints =
+    Array.isArray(startRaw) && startRaw.length > 0 ? validatePoints(startRaw) : null;
+  const endSegmentPoints =
+    Array.isArray(endRaw) && endRaw.length > 0 ? validatePoints(endRaw) : null;
   if (!startTime || Number.isNaN(new Date(startTime).getTime())) {
     throw { status: 400, message: "startTime \u683C\u5F0F\u4E0D\u6B63\u786E" };
   }
@@ -30134,8 +30132,8 @@ function buildActivity(body) {
     laps,
     jitter ? routeOffsetMeters : 0,
     loop,
-    firstLapPoints,
-    lastLapPoints
+    startSegmentPoints,
+    endSegmentPoints
   );
   const distances = [0];
   let totalDist = 0;

@@ -360,14 +360,14 @@ button.secondary:disabled:hover {
   background: #ff5722;
 }
 
-.seg-tab[data-segment="first"].active,
-.seg-tab[data-segment="first"].active:hover {
+.seg-tab[data-segment="start"].active,
+.seg-tab[data-segment="start"].active:hover {
   background: #16a34a;
   border-color: #16a34a;
 }
 
-.seg-tab[data-segment="last"].active,
-.seg-tab[data-segment="last"].active:hover {
+.seg-tab[data-segment="end"].active,
+.seg-tab[data-segment="end"].active:hover {
   background: #2563eb;
   border-color: #2563eb;
 }
